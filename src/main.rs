@@ -262,6 +262,11 @@ async fn cmd_serve(config_path: &Path, auth_path: &Path) -> Result<()> {
         "background balance poll: every {}s",
         config.runtime.balance_poll_secs
     );
+    println!(
+        "background token refresh: {}s before expiry (scan every {}s)",
+        config.runtime.refresh_skew_secs,
+        ((config.runtime.refresh_skew_secs.max(1) as u64) / 2).clamp(5, 60)
+    );
     let background = manager.clone();
     tokio::spawn(async move { background.background_loop().await });
     server::serve(AppState::new(config, manager)?).await

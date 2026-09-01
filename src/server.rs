@@ -488,7 +488,27 @@ async fn send_with_failover(
         .await?;
         match response.status().as_u16() {
             401 | 403 => {
-                match state.accounts.force_refresh(&account_name).await {
+                let stream = request_is_stream(headers, &body);
+                if stream {
+                    tracing::warn!(
+                        request_id = request_id(headers),
+                        account = %account_name,
+                        path = path.split('?').next().unwrap_or(path),
+                        "oauth stream retrying after forced refresh"
+                    );
+                } else {
+                    tracing::warn!(
+                        request_id = request_id(headers),
+                        account = %account_name,
+                        path = path.split('?').next().unwrap_or(path),
+                        "oauth request retrying after forced refresh"
+                    );
+                }
+                match state
+                    .accounts
+                    .force_refresh_after_rejection(&account_name, &selected.access_token)
+                    .await
+                {
                     Ok(new_token) => {
                         refreshed = true;
                         let retry = send_once(
@@ -508,7 +528,10 @@ async fn send_with_failover(
                                 failover_count,
                             });
                         }
-                        state.accounts.mark_unauthorized(&account_name).await?;
+                        state
+                            .accounts
+                            .mark_unauthorized_if_current(&account_name, &new_token.access_token)
+                            .await?;
                     }
                     Err(error) => {
                         tracing::warn!(account = %account_name, error = %public_error(&error), "account authorization refresh failed");
@@ -532,6 +555,17 @@ async fn send_with_failover(
             }
         }
     }
+}
+
+fn request_is_stream(headers: &HeaderMap, body: &Bytes) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+        || serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| value.get("stream").and_then(Value::as_bool))
+            .unwrap_or(false)
 }
 
 async fn send_once(
@@ -1215,6 +1249,18 @@ mod tests {
         )
     }
 
+    async fn valid_refresh_handler() -> impl IntoResponse {
+        Json(json!({
+            "code": 0,
+            "data": {
+                "access_token": "stream-refreshed-token",
+                "refresh_token": "stream-rotated-refresh",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            }
+        }))
+    }
+
     fn gateway_request(method: Method, uri: &str, body: impl Into<Body>) -> Request<Body> {
         Request::builder()
             .method(method)
@@ -1382,6 +1428,77 @@ mod tests {
         assert_eq!(seen[1].authorization, "Bearer token-b");
         drop(seen);
         assert!(AuthStore::load(&auth_path).unwrap().accounts["alice"].reauth_required);
+        task.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_connection_unauthorized_forces_refresh_and_reconnects_once() {
+        let mock = MockUpstream {
+            unauthorized_first: true,
+            ..MockUpstream::default()
+        };
+        let upstream = Router::new()
+            .route("/api/v1/*rest", any(mock_upstream_handler))
+            .route("/oauth/token", post(valid_refresh_handler))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let auth_path = std::env::temp_dir().join(format!(
+            "mogick-stream-refresh-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut auth = AuthStore::default();
+        auth.accounts.insert(
+            "alice".into(),
+            AccountAuth {
+                access_token: "token-a".into(),
+                refresh_token: "refresh-alice".into(),
+                token_expiry: Utc::now().timestamp() + 3600,
+                enabled: true,
+                ..AccountAuth::default()
+            },
+        );
+        auth.save(&auth_path).unwrap();
+        let mut config = Config::default();
+        config.server.api_key = "gateway-secret".into();
+        config.upstream.base_url = format!("http://{address}");
+        let oauth = crate::config::OAuthConfig {
+            client_id: "mogick".into(),
+            device_authorization_endpoint: format!("http://{address}/device"),
+            token_endpoint: format!("http://{address}/oauth/token"),
+            scope: "openid profile email".into(),
+        };
+        let manager =
+            AccountManager::new_with_oauth(config.clone(), auth_path.clone(), oauth).unwrap();
+        let app = router(AppState::new(config, manager).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                Method::POST,
+                "/v1/chat/completions",
+                Body::from(r#"{"model":"future-model","messages":[],"stream":true}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .contains("text/event-stream"));
+        let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&response_body).contains("[DONE]"));
+        let seen = mock.seen.lock().await;
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].authorization, "Bearer token-a");
+        assert_eq!(seen[1].authorization, "Bearer stream-refreshed-token");
+        drop(seen);
+        let stored = AuthStore::load(&auth_path).unwrap();
+        assert_eq!(
+            stored.accounts["alice"].refresh_token,
+            "stream-rotated-refresh"
+        );
+        assert!(!stored.accounts["alice"].reauth_required);
         task.abort();
         std::fs::remove_file(auth_path).unwrap();
     }
@@ -1556,15 +1673,8 @@ mod tests {
                 .find(|(_, account)| account.usable())
                 .map(|(name, _)| name)
                 .expect("a usable account is required");
-            match state.accounts.force_refresh(&account).await {
-                Ok(refreshed) => assert!(refreshed.refreshed),
-                Err(error) => assert!(
-                    error
-                        .chain()
-                        .any(|cause| cause.to_string().contains("token_error_invalid_request")),
-                    "unexpected refresh failure category"
-                ),
-            }
+            let refreshed = state.accounts.force_refresh(&account).await.unwrap();
+            assert!(refreshed.refreshed);
         }
 
         let models = send_with_failover(

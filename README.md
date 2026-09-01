@@ -70,7 +70,7 @@ x-api-key: <server.api_key>
 
 OAuth、余额和 Copilot 请求默认直连，不继承进程的 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`。这可避免本机 SOCKS 代理不支持或对 Tongyuan 域名 TLS 中断时导致刷新在收到响应前失败。
 
-Tongyuan 的 refresh token 已绑定原始公共客户端；刷新请求只发送 `grant_type=refresh_token` 和 `refresh_token`。该服务当前在 refresh 时重复发送 `client_id` 或 `scope` 会返回 HTTP 500，而且部分账户即使刚完成登录也会收到 `invalid_request`。遇到后账户会标记为需要下次交互登录，但仍可继续使用尚未过期的 access token；上游明确以 401/403 拒绝 access token 时才会立即移出账户池。
+Tongyuan 的 refresh 请求使用 RFC 6749 表单，并明确发送 `grant_type=refresh_token`、`refresh_token`、`client_id=mogick` 和 `scope=openid profile email`，同时携带 `Accept: application/json` 与 `X-App-Id: mogick`。响应兼容标准 RFC 6749 JSON 和 `{code,data}` 信封（实际 IdP 成功码可能为 `0` 或 `200`）；服务端轮换 refresh token 时会与新 access token 一起原子保存。刷新被明确拒绝后账户会标记为需要重新登录，但尚未过期的 access token 不会因瞬态网络故障被提前清除。
 
 ## OpenAI 兼容 API
 
@@ -102,10 +102,11 @@ Messages 转换覆盖 system、text、image、document、tools、tool choice、�
 
 ## 多账户和失败策略
 
-网关从 enabled、无需重登且有凭据的账户中选择 `last_used` 最早者。每个账户有独立 refresh lock，并发请求只会触发一次 refresh。
+网关从 enabled、无需重登且有凭据的账户中选择 `last_used` 最早者。每个账户用 CAS、独立 refresh singleflight 和 `Notify` 协调等待者；同一旧 access token 引发的并发请求只会调用一次 refresh，完成后所有等待者共同使用新 token。
 
-- token 临近到期：只刷新选中的账户。
-- 上游 401/403：强制刷新该账户并重试一次；仍失败或 refresh token 失效时标记需重登并切换账户。
+- 后台预刷新与余额探活使用独立节拍；在 `runtime.refresh_skew_secs` 窗口内提前刷新，使请求尽量总能取得热 token。
+- 上游 401/403：强制刷新该账户并重试一次；SSE 在发送任何响应数据前的建连 401/403 同样用新 token 重建连接，并记录 `oauth stream retrying after forced refresh`。一旦已向客户端发送 SSE 数据便不重放，避免重复输出。
+- refresh token 被明确拒绝或上游报告 `keystone_iam` 不支持刷新：标记需重登并提示运行 `mogick-provider login --account <name> --force`，随后切换其他账户。瞬态网络错误不会误标为必须重登。
 - 上游 429：切换到下一账户。
 - 网络错误和 5xx：不重放生成请求。
 - 后台逐账户刷新和余额探活；`404 ACCOUNT_NOT_FOUND` 作为免费账户正常状态记录为 INFO。

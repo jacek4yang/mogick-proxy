@@ -50,11 +50,11 @@ struct OAuthError {
 
 pub fn parse_token_response(body: &str) -> Result<TokenResponse> {
     if let Ok(token) = serde_json::from_str::<TokenResponse>(body) {
-        return Ok(token);
+        return validate_token_response(token);
     }
     if let Ok(wrapped) = serde_json::from_str::<WrappedTokenResponse>(body) {
-        if wrapped.code == 0 {
-            return Ok(wrapped.data);
+        if matches!(wrapped.code, 0 | 200) {
+            return validate_token_response(wrapped.data);
         }
         bail!("token_business_code_{}", wrapped.code);
     }
@@ -71,6 +71,13 @@ pub fn parse_token_response(body: &str) -> Result<TokenResponse> {
         }
     }
     Err(anyhow!("token endpoint returned an unrecognized response"))
+}
+
+fn validate_token_response(token: TokenResponse) -> Result<TokenResponse> {
+    if token.access_token.trim().is_empty() {
+        bail!("token endpoint returned an empty access token");
+    }
+    Ok(token)
 }
 
 pub async fn request_device_code(
@@ -117,6 +124,8 @@ pub async fn poll_for_token(
         poll_sleep(interval).await;
         let response = http
             .post(&config.token_endpoint)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header("X-App-Id", crate::config::defaults::UPSTREAM_X_APP_ID)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", device.device_code.as_str()),
@@ -175,15 +184,15 @@ pub async fn refresh_access_token(
     refresh_token: &str,
 ) -> Result<TokenResponse> {
     let started = std::time::Instant::now();
-    // This provider binds the refresh token to its original public client.
-    // Its live endpoint returns HTTP 500 when `client_id` or `scope` is
-    // repeated on a refresh request, despite accepting both during device
-    // authorization. Send only the two RFC-required refresh fields.
     let response = http
         .post(&config.token_endpoint)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header("X-App-Id", crate::config::defaults::UPSTREAM_X_APP_ID)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
+            ("client_id", config.client_id.as_str()),
+            ("scope", config.scope.as_str()),
         ])
         .send()
         .await;
@@ -303,6 +312,12 @@ fn oauth_error_summary(body: &str) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
+    if message.contains("token refresh is not supported")
+        || message.contains("refresh token is not supported")
+        || message.contains("keystone_iam token refresh")
+    {
+        return "refresh_not_supported".into();
+    }
     for marker in [
         "invalid_grant",
         "invalid_token",
@@ -310,6 +325,7 @@ fn oauth_error_summary(body: &str) -> String {
         "refresh_token_expired",
         "unauthorized_client",
         "not_supported",
+        "refresh_not_supported",
     ] {
         if message.contains(marker) {
             return marker.into();
@@ -352,7 +368,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::extract::{Form, State};
-    use axum::http::StatusCode;
+    use axum::http::{header, HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     use axum::routing::post;
     use axum::{Json, Router};
@@ -376,8 +392,25 @@ mod tests {
 
     async fn token_handler(
         State(state): State<MockState>,
+        headers: HeaderMap,
         Form(form): Form<HashMap<String, String>>,
     ) -> impl IntoResponse {
+        assert_eq!(
+            headers
+                .get(header::ACCEPT)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            headers
+                .get("x-app-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("mogick")
+        );
+        assert!(headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded")));
         if form.get("grant_type").map(String::as_str)
             == Some("urn:ietf:params:oauth:grant-type:device_code")
         {
@@ -387,8 +420,11 @@ mod tests {
                 form.get("grant_type").map(String::as_str),
                 Some("refresh_token")
             );
-            assert!(!form.contains_key("client_id"));
-            assert!(!form.contains_key("scope"));
+            assert_eq!(form.get("client_id").map(String::as_str), Some("mogick"));
+            assert_eq!(
+                form.get("scope").map(String::as_str),
+                Some("openid profile email")
+            );
         }
         state.calls.fetch_add(1, Ordering::SeqCst);
         let (status, body) = state.responses.lock().await.pop_front().unwrap();
@@ -434,7 +470,13 @@ mod tests {
             parse_token_response(r#"{"code":0,"data":{"access_token":"b","refresh_token":"rr"}}"#)
                 .unwrap();
         assert_eq!(wrapped.access_token, "b");
+        let wrapped_http_code = parse_token_response(
+            r#"{"code":200,"data":{"access_token":"c","refresh_token":"rrr"}}"#,
+        )
+        .unwrap();
+        assert_eq!(wrapped_http_code.access_token, "c");
         assert!(parse_token_response(r#"{"code":123,"data":{}}"#).is_err());
+        assert!(parse_token_response(r#"{"access_token":""}"#).is_err());
         let invalid_refresh = parse_token_response(
             r#"{"code":400,"data":{"errorCode":"invalid_request"},"message":"redacted"}"#,
         )
@@ -450,6 +492,17 @@ mod tests {
         );
         assert_eq!(summary, "invalid_grant");
         assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn keystone_refresh_limitation_is_permanent_and_redacted() {
+        let summary = oauth_error_summary(
+            r#"{"message":"keystone_iam token refresh is not supported, Bearer do-not-print"}"#,
+        );
+        assert_eq!(summary, "refresh_not_supported");
+        let error = anyhow!(summary);
+        assert!(is_permanent_refresh_error(&error));
+        assert!(!error.to_string().contains("do-not-print"));
     }
 
     #[tokio::test]
