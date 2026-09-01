@@ -1,0 +1,14 @@
+/target/
+
+# Local runtime configuration and credentials
+/config.json
+/auth.json
+/*.json.tmp
+/*.auth.tmp
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
