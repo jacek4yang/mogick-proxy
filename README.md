@@ -53,7 +53,7 @@ OAuth client、scope 和端点是 provider 固有常量，不写入配置。`aut
 - `--config PATH` / `MOGICK_PROVIDER_CONFIG`
 - `--auth PATH` / `MOGICK_PROVIDER_AUTH`
 - `RUST_LOG` 覆盖 `runtime.log_level`
-- `runtime.log_format` 可设为 `pretty` 或 `json`
+- `runtime.log_format` 可设为 `pretty`（compact 单行文本）或 `json`（单行 JSON）
 
 首次读取旧版 `config.json` 时，程序会先把 `oauth/tokens/accounts` 中的凭据原子写入并重新校验 `auth.json`，随后才重写无凭据的配置。任何步骤失败都会保留旧配置；已有同名但不同的账户凭据不会被覆盖。
 
@@ -67,6 +67,10 @@ x-api-key: <server.api_key>
 ```
 
 密钥为空时只接受 loopback 来源。上游认证头永远由网关重建，并强制使用 `X-App-Id: mogick`；调用者和 `extra_headers` 都不能覆盖 OAuth Authorization、cookie、Host、Content-Length 或 X-App-Id。
+
+OAuth、余额和 Copilot 请求默认直连，不继承进程的 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`。这可避免本机 SOCKS 代理不支持或对 Tongyuan 域名 TLS 中断时导致刷新在收到响应前失败。
+
+Tongyuan 的 refresh token 已绑定原始公共客户端；刷新请求只发送 `grant_type=refresh_token` 和 `refresh_token`。该服务当前在 refresh 时重复发送 `client_id` 或 `scope` 会返回 HTTP 500，而且部分账户即使刚完成登录也会收到 `invalid_request`。遇到后账户会标记为需要下次交互登录，但仍可继续使用尚未过期的 access token；上游明确以 401/403 拒绝 access token 时才会立即移出账户池。
 
 ## OpenAI 兼容 API
 
@@ -108,7 +112,7 @@ Messages 转换覆盖 system、text、image、document、tools、tool choice、�
 
 ## 日志与错误
 
-请求日志包含 request ID、协议、模型、账户、路径、stream、状态、耗时、请求/响应字节、refresh 和 failover。不会记录请求正文。错误正文会截断，并递归清除 Authorization、cookie、API key、access/refresh token、Bearer 和 JWT。
+所有入站响应和每次上游尝试都会生成单行日志，包括鉴权失败、请求大小错误、健康检查、401 重试、429 切换、OAuth 和余额响应。请求日志包含 request ID、协议、模型、账户、路径、stream、状态、耗时、请求/响应字节、refresh 和 failover。不会记录请求正文。错误正文会截断，并递归清除 Authorization、cookie、API key、access/refresh token、Bearer 和 JWT。
 
 Anthropic 错误使用：
 
@@ -133,6 +137,7 @@ cargo build --release
 
 ```bash
 MOGICK_PROVIDER_REAL_TEST=1 \
+MOGICK_REAL_FORCE_REFRESH=1 \
 MOGICK_REAL_CHAT_MODEL=deepseek-v4-flash \
 MOGICK_REAL_EMBEDDING_MODEL=mm-embedding \
 cargo test real_upstream_opt_in_smoke_suite -- --ignored

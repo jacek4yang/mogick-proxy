@@ -31,6 +31,9 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config, accounts: AccountManager) -> Result<Self> {
         let http = reqwest::Client::builder()
+            // The configured provider is reached directly. Incoming gateway
+            // traffic is unaffected by this outbound proxy policy.
+            .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(config.upstream.timeout_secs))
             .build()
@@ -66,6 +69,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             auth_middleware,
         ))
+        .layer(middleware::from_fn(response_log_middleware))
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }
@@ -538,6 +542,9 @@ async fn send_once(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<reqwest::Response> {
+    let started = Instant::now();
+    let request_id = request_id(headers);
+    let log_path = path.split('?').next().unwrap_or(path);
     let url = format!(
         "{}{}",
         state.config.upstream.base_url.trim_end_matches('/'),
@@ -545,7 +552,7 @@ async fn send_once(
     );
     let mut request = state
         .http
-        .request(method, url)
+        .request(method.clone(), url)
         .bearer_auth(&account.access_token);
     for (name, value) in headers {
         if is_forwardable_request_header(name.as_str()) {
@@ -561,11 +568,36 @@ async fn send_once(
     if !headers.contains_key(header::CONTENT_TYPE) && !body.is_empty() {
         request = request.header(header::CONTENT_TYPE, "application/json");
     }
-    request
-        .body(body)
-        .send()
-        .await
-        .context("upstream request failed")
+    let response = request.body(body).send().await;
+    match &response {
+        Ok(response) => tracing::info!(
+            direction = "upstream",
+            request_id,
+            account = %account.name,
+            method = %method,
+            path = log_path,
+            status = response.status().as_u16(),
+            duration_ms = started.elapsed().as_millis(),
+            response_bytes = response.content_length().unwrap_or(0),
+            content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or(""),
+            "upstream response"
+        ),
+        Err(error) => tracing::warn!(
+            direction = "upstream",
+            request_id,
+            account = %account.name,
+            method = %method,
+            path = log_path,
+            duration_ms = started.elapsed().as_millis(),
+            error = safe_reqwest_error(error),
+            "upstream request failed"
+        ),
+    }
+    response.context("upstream request failed")
 }
 
 async fn upstream_openai_response(response: reqwest::Response, request_id: &str) -> Response {
@@ -735,6 +767,41 @@ async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Respon
     response
 }
 
+async fn response_log_middleware(request: Request<Body>, next: Next) -> Response {
+    let started = Instant::now();
+    let request_id = request_id(request.headers());
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let protocol = if is_anthropic_request(&path, request.headers()) {
+        "anthropic"
+    } else {
+        "openai"
+    };
+    let response = next.run(request).await;
+    tracing::info!(
+        direction = "client",
+        request_id,
+        protocol,
+        method = %method,
+        path,
+        status = response.status().as_u16(),
+        duration_ms = started.elapsed().as_millis(),
+        response_bytes = response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0),
+        content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        "client response"
+    );
+    response
+}
+
 async fn auth_middleware(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -885,6 +952,18 @@ fn public_error(error: &anyhow::Error) -> &'static str {
         "could not connect to upstream"
     } else {
         "upstream request failed"
+    }
+}
+
+fn safe_reqwest_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "upstream request timed out"
+    } else if error.is_connect() {
+        "could not connect to upstream"
+    } else if error.is_request() {
+        "upstream request could not be sent"
+    } else {
+        "upstream response failed"
     }
 }
 
@@ -1465,6 +1544,28 @@ mod tests {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         )]);
+
+        if std::env::var("MOGICK_REAL_FORCE_REFRESH").as_deref() == Ok("1") {
+            let account = state
+                .accounts
+                .snapshots()
+                .await
+                .unwrap()
+                .accounts
+                .into_iter()
+                .find(|(_, account)| account.usable())
+                .map(|(name, _)| name)
+                .expect("a usable account is required");
+            match state.accounts.force_refresh(&account).await {
+                Ok(refreshed) => assert!(refreshed.refreshed),
+                Err(error) => assert!(
+                    error
+                        .chain()
+                        .any(|cause| cause.to_string().contains("token_error_invalid_request")),
+                    "unexpected refresh failure category"
+                ),
+            }
+        }
 
         let models = send_with_failover(
             &state,

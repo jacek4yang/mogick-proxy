@@ -46,8 +46,6 @@ struct WrappedTokenResponse {
 struct OAuthError {
     #[serde(default)]
     error: String,
-    #[serde(default)]
-    error_description: String,
 }
 
 pub fn parse_token_response(body: &str) -> Result<TokenResponse> {
@@ -58,14 +56,18 @@ pub fn parse_token_response(body: &str) -> Result<TokenResponse> {
         if wrapped.code == 0 {
             return Ok(wrapped.data);
         }
-        bail!(
-            "token endpoint returned business error code {}",
-            wrapped.code
-        );
+        bail!("token_business_code_{}", wrapped.code);
     }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(error_code) = value
+            .get("data")
+            .and_then(|data| data.get("errorCode"))
+            .and_then(serde_json::Value::as_str)
+        {
+            bail!("token_error_{}", safe_oauth_code(error_code));
+        }
         if let Some(code) = value.get("code").and_then(serde_json::Value::as_i64) {
-            bail!("token endpoint returned business error code {code}");
+            bail!("token_business_code_{code}");
         }
     }
     Err(anyhow!("token endpoint returned an unrecognized response"))
@@ -85,6 +87,11 @@ pub async fn request_device_code(
         .await
         .context("requesting device code")?;
     let status = response.status();
+    tracing::info!(
+        oauth_operation = "device_code",
+        status = status.as_u16(),
+        "OAuth response"
+    );
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
         bail!(
@@ -121,12 +128,28 @@ pub async fn poll_for_token(
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if status.is_success() {
-            return parse_token_response(&body);
+            let parsed = parse_token_response(&body);
+            tracing::info!(
+                oauth_operation = "device_poll",
+                status = status.as_u16(),
+                result = if parsed.is_ok() {
+                    "token"
+                } else {
+                    "invalid_payload"
+                },
+                "OAuth response"
+            );
+            return parsed;
         }
         let error = serde_json::from_str::<OAuthError>(&body).unwrap_or(OAuthError {
             error: format!("http_{}", status.as_u16()),
-            error_description: String::new(),
         });
+        tracing::info!(
+            oauth_operation = "device_poll",
+            status = status.as_u16(),
+            oauth_error = %safe_oauth_code(&error.error),
+            "OAuth response"
+        );
         match error.error.as_str() {
             "authorization_pending" => continue,
             "slow_down" => {
@@ -151,38 +174,148 @@ pub async fn refresh_access_token(
     config: &OAuthConfig,
     refresh_token: &str,
 ) -> Result<TokenResponse> {
+    let started = std::time::Instant::now();
+    // This provider binds the refresh token to its original public client.
+    // Its live endpoint returns HTTP 500 when `client_id` or `scope` is
+    // repeated on a refresh request, despite accepting both during device
+    // authorization. Send only the two RFC-required refresh fields.
     let response = http
         .post(&config.token_endpoint)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("client_id", config.client_id.as_str()),
-            ("scope", config.scope.as_str()),
         ])
         .send()
-        .await
-        .context("requesting token refresh")?;
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                oauth_operation = "refresh",
+                result = "transport_error",
+                oauth_error = classify_transport_error(&error),
+                duration_ms = started.elapsed().as_millis(),
+                "OAuth request failed"
+            );
+            return Err(error).context("requesting token refresh");
+        }
+    };
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if status.is_success() {
-        return parse_token_response(&body);
+        let parsed = parse_token_response(&body);
+        match &parsed {
+            Ok(_) => tracing::info!(
+                oauth_operation = "refresh",
+                status = status.as_u16(),
+                result = "token",
+                duration_ms = started.elapsed().as_millis(),
+                "OAuth response"
+            ),
+            Err(error) => tracing::warn!(
+                oauth_operation = "refresh",
+                status = status.as_u16(),
+                result = "invalid_payload",
+                oauth_error = %safe_parse_error(error),
+                duration_ms = started.elapsed().as_millis(),
+                "OAuth response"
+            ),
+        }
+        return parsed;
     }
     let summary = oauth_error_summary(&body);
+    tracing::warn!(
+        oauth_operation = "refresh",
+        status = status.as_u16(),
+        oauth_error = %summary,
+        duration_ms = started.elapsed().as_millis(),
+        "OAuth response"
+    );
     bail!("refresh_failed:{summary} (HTTP {status})")
 }
 
-fn oauth_error_summary(body: &str) -> String {
-    serde_json::from_str::<OAuthError>(body)
-        .ok()
-        .map(|error| {
-            let code = safe_oauth_code(&error.error);
-            if error.error_description.is_empty() {
-                code
-            } else {
-                format!("{code}: request rejected")
-            }
+fn safe_parse_error(error: &anyhow::Error) -> String {
+    error
+        .to_string()
+        .split_whitespace()
+        .find(|part| part.starts_with("token_business_code_") || part.starts_with("token_error_"))
+        .map(|part| {
+            part.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && character != '_'
+            })
+            .to_string()
         })
-        .unwrap_or_else(|| "request rejected".into())
+        .unwrap_or_else(|| "unrecognized_token_payload".into())
+}
+
+fn classify_transport_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect_error"
+    } else if error.is_builder() {
+        "request_builder_error"
+    } else if error.is_request() {
+        "request_error"
+    } else if error.is_decode() {
+        "decode_error"
+    } else {
+        "transport_error"
+    }
+}
+
+fn oauth_error_summary(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return "request_rejected".into();
+    };
+    let standard = value
+        .get("error")
+        .and_then(|error| {
+            error
+                .as_str()
+                .or_else(|| error.get("code").and_then(serde_json::Value::as_str))
+        })
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|data| data.get("error"))
+                .and_then(serde_json::Value::as_str)
+        });
+    if let Some(code) = standard {
+        let code = safe_oauth_code(code);
+        return if code.is_empty() {
+            "request_rejected".into()
+        } else {
+            code
+        };
+    }
+    if let Some(code) = value.get("code") {
+        let code = code
+            .as_str()
+            .map(safe_oauth_code)
+            .or_else(|| code.as_i64().map(|code| code.to_string()))
+            .unwrap_or_else(|| "unknown".into());
+        return format!("business_code_{code}");
+    }
+    let message = value
+        .get("message")
+        .or_else(|| value.get("msg"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for marker in [
+        "invalid_grant",
+        "invalid_token",
+        "expired_token",
+        "refresh_token_expired",
+        "unauthorized_client",
+        "not_supported",
+    ] {
+        if message.contains(marker) {
+            return marker.into();
+        }
+    }
+    "request_rejected".into()
 }
 
 fn safe_oauth_code(code: &str) -> String {
@@ -197,9 +330,15 @@ pub fn is_permanent_refresh_error(error: &anyhow::Error) -> bool {
     [
         "invalid_grant",
         "invalid_token",
+        "expired_token",
+        "refresh_token_expired",
         "access_denied",
         "not_supported",
         "unauthorized_client",
+        "token_business_code_400",
+        "token_business_code_401",
+        "token_business_code_403",
+        "token_error_invalid_request",
     ]
     .iter()
     .any(|marker| message.contains(marker))
@@ -239,7 +378,18 @@ mod tests {
         State(state): State<MockState>,
         Form(form): Form<HashMap<String, String>>,
     ) -> impl IntoResponse {
-        assert_eq!(form.get("client_id").map(String::as_str), Some("mogick"));
+        if form.get("grant_type").map(String::as_str)
+            == Some("urn:ietf:params:oauth:grant-type:device_code")
+        {
+            assert_eq!(form.get("client_id").map(String::as_str), Some("mogick"));
+        } else {
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("refresh_token")
+            );
+            assert!(!form.contains_key("client_id"));
+            assert!(!form.contains_key("scope"));
+        }
         state.calls.fetch_add(1, Ordering::SeqCst);
         let (status, body) = state.responses.lock().await.pop_front().unwrap();
         (status, Json(body))
@@ -285,6 +435,12 @@ mod tests {
                 .unwrap();
         assert_eq!(wrapped.access_token, "b");
         assert!(parse_token_response(r#"{"code":123,"data":{}}"#).is_err());
+        let invalid_refresh = parse_token_response(
+            r#"{"code":400,"data":{"errorCode":"invalid_request"},"message":"redacted"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(invalid_refresh.to_string(), "token_error_invalid_request");
+        assert!(is_permanent_refresh_error(&invalid_refresh));
     }
 
     #[test]
@@ -292,7 +448,7 @@ mod tests {
         let summary = oauth_error_summary(
             r#"{"error":"invalid_grant","error_description":"Bearer secret.jwt.value"}"#,
         );
-        assert_eq!(summary, "invalid_grant: request rejected");
+        assert_eq!(summary, "invalid_grant");
         assert!(!summary.contains("secret"));
     }
 

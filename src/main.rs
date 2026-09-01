@@ -113,7 +113,9 @@ fn init_tracing(config: &Config) {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_target(false)
-                .pretty()
+                .with_file(false)
+                .with_line_number(false)
+                .compact()
                 .try_init();
         }
         LogFormat::Json => {
@@ -159,6 +161,9 @@ async fn cmd_login(
 
     let oauth = provider_oauth();
     let http = reqwest::Client::builder()
+        // Provider endpoints are directly reachable; a broken system SOCKS
+        // proxy must not prevent device login or token rotation.
+        .no_proxy()
         .timeout(Duration::from_secs(30))
         .build()
         .context("building OAuth client")?;

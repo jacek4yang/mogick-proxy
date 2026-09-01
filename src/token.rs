@@ -55,6 +55,10 @@ impl AccountManager {
         oauth: OAuthConfig,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
+            // OAuth, balance, and provider APIs are intentionally direct.
+            // This also prevents unsupported/broken SOCKS environment proxies
+            // from turning every refresh into an immediate connect error.
+            .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(config.upstream.timeout_secs))
             .build()
@@ -111,6 +115,13 @@ impl AccountManager {
         if !account.usable() {
             bail!("account {name:?} is disabled or requires login");
         }
+        if account.reauth_required && account.has_valid_access() && !force {
+            return Ok(SelectedAccount {
+                name: name.into(),
+                access_token: account.access_token,
+                refreshed: false,
+            });
+        }
         if !force && !account.needs_refresh(self.inner.config.runtime.refresh_skew_secs) {
             return Ok(SelectedAccount {
                 name: name.into(),
@@ -153,8 +164,18 @@ impl AccountManager {
     pub async fn mark_unauthorized(&self, name: &str) -> Result<()> {
         let lock = self.account_lock(name).await;
         let _account_guard = lock.lock().await;
-        self.mark_reauth_locked(name, "upstream rejected refreshed credentials")
-            .await
+        let _guard = self.inner.store_lock.lock().await;
+        let mut auth = AuthStore::load(&self.inner.auth_path)?;
+        if let Some(account) = auth.accounts.get_mut(name) {
+            account.access_token.clear();
+            account.token_expiry = 0;
+            account.reauth_required = true;
+            account.last_error = Some(AuthErrorRecord {
+                at: Utc::now().timestamp(),
+                message: "upstream rejected refreshed credentials".into(),
+            });
+        }
+        auth.save(&self.inner.auth_path)
     }
 
     pub async fn store_login(&self, name: &str, response: &TokenResponse) -> Result<()> {
@@ -254,6 +275,7 @@ impl AccountManager {
     }
 
     async fn probe_balance(&self, name: &str) -> Result<BalanceResult> {
+        let started = std::time::Instant::now();
         let selected = self.current_token_for(name, false).await?;
         let url = format!(
             "{}{}/user/balance",
@@ -269,6 +291,16 @@ impl AccountManager {
         request = request.header("X-App-Id", crate::config::defaults::UPSTREAM_X_APP_ID);
         let response = request.send().await.context("requesting user balance")?;
         let status = response.status();
+        tracing::info!(
+            direction = "upstream",
+            operation = "balance",
+            account = name,
+            path = "/api/v1/user/balance",
+            status = status.as_u16(),
+            duration_ms = started.elapsed().as_millis(),
+            response_bytes = response.content_length().unwrap_or(0),
+            "upstream response"
+        );
         let body = response.text().await.unwrap_or_default();
         if status.as_u16() == 404 && body.contains("ACCOUNT_NOT_FOUND") {
             return Ok(BalanceResult::FreeTier);
@@ -396,11 +428,42 @@ fn expires_at(expires_in: Option<i64>) -> i64 {
 }
 
 fn safe_error(error: &anyhow::Error) -> String {
-    let message = error.to_string().to_ascii_lowercase();
-    if message.contains("invalid_grant") {
-        "invalid_grant; login required".into()
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if let Some(reason) = [
+        "invalid_grant",
+        "invalid_token",
+        "expired_token",
+        "refresh_token_expired",
+        "access_denied",
+        "not_supported",
+        "unauthorized_client",
+    ]
+    .into_iter()
+    .find(|reason| message.contains(reason))
+    {
+        format!("{reason}; login required")
+    } else if let Some(status) = [400, 401, 403, 404, 429, 500, 502, 503]
+        .into_iter()
+        .find(|status| message.contains(&format!("http {status}")))
+    {
+        format!("token refresh rejected (HTTP {status})")
+    } else if let Some(code) = message
+        .split_whitespace()
+        .find(|part| part.starts_with("token_business_code_") || part.starts_with("token_error_"))
+    {
+        format!(
+            "token refresh rejected ({})",
+            code.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        )
     } else if message.contains("timeout") {
         "request timed out".into()
+    } else if message.contains("builder") {
+        "OAuth request could not be built".into()
     } else if message.contains("connect") {
         "connection failed".into()
     } else if message.contains("refresh") {

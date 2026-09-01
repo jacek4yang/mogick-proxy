@@ -232,7 +232,13 @@ impl AccountAuth {
     }
 
     pub fn usable(&self) -> bool {
-        self.enabled && !self.reauth_required && self.has_credentials()
+        self.enabled
+            && (self.has_valid_access()
+                || (!self.reauth_required && !self.refresh_token.is_empty()))
+    }
+
+    pub fn has_valid_access(&self) -> bool {
+        !self.access_token.is_empty() && self.token_expiry > chrono::Utc::now().timestamp()
     }
 
     pub fn needs_refresh(&self, skew_secs: i64) -> bool {
@@ -432,6 +438,21 @@ mod tests {
             config.upstream.extra_headers.get("X-App-Id").unwrap(),
             "mogick"
         );
+    }
+
+    #[test]
+    fn reauth_required_keeps_only_unexpired_access_usable() {
+        let mut account = AccountAuth {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            token_expiry: chrono::Utc::now().timestamp() + 60,
+            enabled: true,
+            reauth_required: true,
+            ..AccountAuth::default()
+        };
+        assert!(account.usable());
+        account.token_expiry = 1;
+        assert!(!account.usable());
     }
 
     #[test]
