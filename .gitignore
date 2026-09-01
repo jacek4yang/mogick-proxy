@@ -5,6 +5,7 @@
 /auth.json
 /*.json.tmp
 /*.auth.tmp
+/*.tmp
 
 # Editor and OS files
 .DS_Store

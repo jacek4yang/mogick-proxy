@@ -1,40 +1,41 @@
-//! Command-line entry point.
-//!
-//! Subcommands:
-//!   - `init`    — write a starter config.json
-//!   - `login`   — interactive OAuth device-code flow
-//!   - `status`  — show current token expiry
-//!   - `logout`  — discard stored tokens
-//!   - `serve`   — start the reverse proxy (default)
+//! mogick-provider command-line entry point.
 
+mod anthropic;
 mod config;
 mod oauth;
 mod server;
 mod token;
 
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::config::{default_config_path, Config};
+use crate::config::{
+    default_auth_path, default_config_path, migrate_legacy, provider_oauth, AuthStore, Config,
+    LogFormat, MigrationOutcome,
+};
 use crate::oauth::{poll_for_token, request_device_code};
 use crate::server::AppState;
-use crate::token::TokenManager;
+use crate::token::AccountManager;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "mogick-proxy",
+    name = "mogick-provider",
     version,
-    about = "OAuth-aware reverse proxy exposing OpenAI-compatible /chat/completions"
+    about = "Multi-account OAuth gateway for OpenAI and Anthropic APIs"
 )]
 struct Cli {
-    /// Path to config.json. Defaults to $MOGICK_PROXY_CONFIG or
-    /// the user's XDG/APPDATA config dir.
+    /// Runtime configuration path (or MOGICK_PROVIDER_CONFIG).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+
+    /// Credential store path (or MOGICK_PROVIDER_AUTH; defaults beside config.json).
+    #[arg(long, global = true)]
+    auth: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -42,237 +43,276 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Write a starter config.json (does not overwrite existing).
+    /// Create config.json and a secure empty auth.json.
     Init,
-    /// Run the interactive OAuth device-code flow and persist the tokens.
+    /// Authorize and store one OAuth account through RFC 8628 device flow.
     Login {
-        /// Force a fresh login even if a refresh_token is already present.
+        #[arg(long)]
+        account: Option<String>,
         #[arg(long)]
         force: bool,
+        /// Print the remote authorization URL without opening a local browser.
+        #[arg(long)]
+        no_open: bool,
     },
-    /// Show current token expiry + scopes.
-    Status,
-    /// Discard stored tokens (forces a fresh `login` next time).
-    Logout,
-    /// Start the reverse proxy. This is the default if no subcommand is given.
+    /// Show credential metadata without printing any token material.
+    Status {
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Disable and clear one account while leaving all other accounts untouched.
+    Logout {
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Run the API gateway (default command).
     Serve,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
     let config_path = cli.config.unwrap_or_else(default_config_path);
+    let auth_path = cli.auth.unwrap_or_else(|| default_auth_path(&config_path));
+    let command = cli.command.unwrap_or(Command::Serve);
 
-    let cmd = cli.command.unwrap_or(Command::Serve);
-    match cmd {
-        Command::Init => cmd_init(&config_path).await,
-        Command::Login { force } => cmd_login(&config_path, force).await,
-        Command::Status => cmd_status(&config_path),
-        Command::Logout => cmd_logout(&config_path),
-        Command::Serve => cmd_serve(&config_path).await,
-    }
-}
+    let logging_config = Config::load_or_default(&config_path).unwrap_or_default();
+    init_tracing(&logging_config);
 
-fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mogick_proxy=debug"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
-}
-
-async fn cmd_init(path: &PathBuf) -> Result<()> {
-    if path.exists() {
-        anyhow::bail!(
-            "config already exists at {} (delete it first if you want a fresh one)",
-            path.display()
-        );
-    }
-    let cfg = Config::load_or_default(path)?;
-    cfg.save(path)?;
-    println!("wrote starter config to {}", path.display());
-    println!();
-    println!("OAuth endpoints + client_id are hard-coded from the Mogick binary.");
-    println!("You can run `mogick-proxy login` right away — no edits required.");
-    println!();
-    println!("Optional next steps:");
-    println!("  - edit config.json to change upstream.base_url (default: https://api.tongyuan.cc/v1)");
-    println!("  - edit config.json to set server.api_key for non-loopback callers");
-    Ok(())
-}
-
-async fn cmd_login(path: &PathBuf, force: bool) -> Result<()> {
-    let mut cfg = Config::load(path)
-        .with_context(|| format!("loading config from {}", path.display()))?;
-    // Apply IDA defaults to any empty OAuth field.
-    cfg.oauth.apply_defaults();
-
-    if !cfg.tokens.refresh_token.is_empty() && !force {
-        println!(
-            "refresh_token already present — use --force to discard and re-authenticate"
-        );
-        return Ok(());
-    }
-
-    println!("OAuth endpoints (hard-coded from Mogick binary):");
-    println!("  client_id  : {}", cfg.oauth.client_id);
-    println!("  device URL : {}", cfg.oauth.device_authorization_endpoint);
-    println!("  token URL  : {}", cfg.oauth.token_endpoint);
-    if !cfg.oauth.scope.is_empty() {
-        println!("  scope      : {}", cfg.oauth.scope);
-    }
-    println!();
-
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("building HTTP client")?;
-
-    println!("requesting device code...");
-    let device = request_device_code(&http, &cfg.oauth).await?;
-
-    let verify_url = device
-        .verification_uri_complete
-        .clone()
-        .unwrap_or_else(|| device.verification_uri.clone());
-
-    println!();
-    println!("== Authorise this device ==");
-    println!("user code : {}", device.user_code);
-    println!("open URL  : {}", verify_url);
-    println!(
-        "expires in: {}s — waiting for you to complete the browser flow...",
-        device.expires_in
-    );
-    println!();
-
-    // Best-effort: open the URL in the user's default browser.
-    if let Err(e) = open_browser(&verify_url) {
-        tracing::debug!(error = %e, "could not auto-open browser");
-    }
-
-    let token = poll_for_token(&http, &cfg.oauth, &device).await?;
-    let mgr = TokenManager::new(path.clone());
-    mgr.store_initial_tokens(&token)?;
-    println!();
-    println!("login OK — tokens persisted to {}", path.display());
-    println!("next: run `mogick-proxy serve` to start the reverse proxy");
-    Ok(())
-}
-
-fn cmd_status(path: &PathBuf) -> Result<()> {
-    let mgr = TokenManager::new(path.clone());
-    let snap = mgr.snapshot()?;
-    if snap.is_empty() {
-        println!("no tokens stored — run `mogick-proxy login`");
-        return Ok(());
-    }
-    let now = chrono::Utc::now().timestamp();
-    let remaining = snap.expires_at.saturating_sub(now);
-    println!("access_token : {}...{}", &snap.access_token[..8.min(snap.access_token.len())],
-        if snap.access_token.len() > 8 { &snap.access_token[snap.access_token.len()-4..] } else { "" });
-    println!("refresh_token: {}...", &snap.refresh_token[..8.min(snap.refresh_token.len())]);
-    println!("token_type   : {}", if snap.token_type.is_empty() { "Bearer" } else { &snap.token_type });
-    println!("scope        : {}", if snap.scope.is_empty() { "(none)" } else { &snap.scope });
-    println!("expires_at   : {} ({} seconds from now)", snap.expires_at, remaining);
-    Ok(())
-}
-
-fn cmd_logout(path: &PathBuf) -> Result<()> {
-    let mgr = TokenManager::new(path.clone());
-    mgr.clear()?;
-    println!("tokens cleared");
-    Ok(())
-}
-
-async fn cmd_serve(path: &PathBuf) -> Result<()> {
-    // First read the raw file (without default-filling) so we can detect
-    // when defaults corrected the user's config and persist the fix back.
-    let raw_before = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Config>(&s).ok())
-        .map(|c| (c.upstream.base_url, c.upstream.chat_path));
-
-    let cfg = Config::load(path)
-        .with_context(|| format!("loading config from {}", path.display()))?;
-
-    if let Some((before_base, before_path)) = raw_before {
-        if before_base != cfg.upstream.base_url || before_path != cfg.upstream.chat_path {
-            let mut cfg = cfg.clone();
-            cfg.save(path).context("persisting corrected upstream config")?;
-            println!(
-                "note: upstream config auto-corrected\n  base_url : {} -> {}\n  chat_path: {} -> {}\n  saved to {}",
-                before_base, cfg.upstream.base_url,
-                before_path, cfg.upstream.chat_path,
-                path.display()
-            );
+    if !matches!(command, Command::Init) {
+        match migrate_legacy(&config_path, &auth_path)? {
+            MigrationOutcome::Migrated => {
+                println!(
+                    "migrated legacy credentials to {} and removed them from {}",
+                    auth_path.display(),
+                    config_path.display()
+                );
+            }
+            MigrationOutcome::NotNeeded => {}
         }
     }
 
-    if cfg.upstream.base_url.is_empty() {
-        anyhow::bail!("upstream.base_url is not configured");
+    match command {
+        Command::Init => cmd_init(&config_path, &auth_path),
+        Command::Login {
+            account,
+            force,
+            no_open,
+        } => cmd_login(&config_path, &auth_path, account, force, no_open).await,
+        Command::Status { account } => cmd_status(&config_path, &auth_path, account).await,
+        Command::Logout { account } => cmd_logout(&config_path, &auth_path, account).await,
+        Command::Serve => cmd_serve(&config_path, &auth_path).await,
     }
-
-    // Verify we have something usable before binding the port. This catches
-    // a missing login early instead of failing on the first request.
-    let mgr = TokenManager::new(path.clone());
-    let snap = mgr.snapshot()?;
-    if snap.is_empty() && cfg.upstream.static_api_key.as_deref().unwrap_or("").is_empty() {
-        anyhow::bail!(
-            "no tokens stored and no upstream.static_api_key set — run `mogick-proxy login` first"
-        );
-    }
-
-    println!("mogick-proxy listening on http://{}", cfg.server.bind);
-    println!("forwarding {} to {}", cfg.upstream.chat_path, cfg.upstream.base_url);
-    println!(
-        "background balance poll: every {}s  →  {}",
-        token::BALANCE_POLL_SECS,
-        format!("{}/api/v1/user/balance", cfg.upstream.base_url.trim_end_matches('/'))
-    );
-
-    // Spawn the background balance + refresh loop. It lives for the
-    // lifetime of the process; the HTTP server owns the foreground.
-    let bg_mgr = mgr.clone();
-    tokio::spawn(async move {
-        bg_mgr.background_loop().await;
-    });
-
-    let state = AppState {
-        config_path: path.clone(),
-        tokens: mgr,
-    };
-    server::serve(state).await
 }
 
-/// Best-effort cross-platform "open URL in default browser".
-fn open_browser(url: &str) -> std::io::Result<()> {
+fn init_tracing(config: &Config) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.runtime.log_level));
+    match config.runtime.log_format {
+        LogFormat::Pretty => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .pretty()
+                .try_init();
+        }
+        LogFormat::Json => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .json()
+                .try_init();
+        }
+    }
+}
+
+fn cmd_init(config_path: &Path, auth_path: &Path) -> Result<()> {
+    if config_path.exists() {
+        bail!("config already exists at {}", config_path.display());
+    }
+    Config::default().save(config_path)?;
+    if !auth_path.exists() {
+        AuthStore::default().save(auth_path)?;
+    }
+    println!("wrote runtime config to {}", config_path.display());
+    println!("wrote secure credential store to {}", auth_path.display());
+    println!("next: mogick-provider login --account <name>");
+    Ok(())
+}
+
+async fn cmd_login(
+    config_path: &Path,
+    auth_path: &Path,
+    account: Option<String>,
+    force: bool,
+    no_open: bool,
+) -> Result<()> {
+    let account = resolve_account(account)?;
+    let config = load_corrected_config(config_path)?;
+    let manager = AccountManager::new(config, auth_path.to_path_buf())?;
+    if let Some(existing) = manager.snapshots().await?.accounts.get(&account) {
+        if existing.has_credentials() && !force {
+            println!("account {account:?} already has credentials; use --force to re-authorize");
+            return Ok(());
+        }
+    }
+
+    let oauth = provider_oauth();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building OAuth client")?;
+    println!("requesting a device code for account {account:?}...");
+    let device = request_device_code(&http, &oauth).await?;
+    let verification_url = device
+        .verification_uri_complete
+        .clone()
+        .unwrap_or_else(|| device.verification_uri.clone());
+    println!();
+    println!("Authorization URL: {verification_url}");
+    println!("User code: {}", device.user_code);
+    println!(
+        "Waiting up to {} seconds for remote authorization...",
+        device.expires_in
+    );
+    if !no_open {
+        if let Err(error) = open_browser(&verification_url) {
+            tracing::debug!(error = %error, "browser open failed; remote authorization remains available");
+        }
+    }
+    let response = poll_for_token(&http, &oauth, &device).await?;
+    manager.store_login(&account, &response).await?;
+    println!("login complete for account {account:?}; credentials saved securely");
+    Ok(())
+}
+
+async fn cmd_status(config_path: &Path, auth_path: &Path, account: Option<String>) -> Result<()> {
+    let config = load_corrected_config(config_path)?;
+    let manager = AccountManager::new(config, auth_path.to_path_buf())?;
+    let store = manager.snapshots().await?;
+    let selected: Vec<_> = match account {
+        Some(name) => {
+            let account = store
+                .accounts
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("account {name:?} does not exist"))?;
+            vec![(name, account)]
+        }
+        None => store
+            .accounts
+            .iter()
+            .map(|(name, account)| (name.clone(), account))
+            .collect(),
+    };
+    if selected.is_empty() {
+        println!("no accounts configured; run mogick-provider login --account <name>");
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    for (name, account) in selected {
+        let remaining = account.token_expiry.saturating_sub(now);
+        println!(
+            "{name}: enabled={} authenticated={} reauth_required={} expires_in={}s scope={}",
+            account.enabled,
+            account.has_credentials(),
+            account.reauth_required,
+            remaining,
+            if account.scope.is_empty() {
+                "(none)"
+            } else {
+                account.scope.as_str()
+            }
+        );
+        if let Some(error) = &account.last_error {
+            println!("  last_error_at={} summary={}", error.at, error.message);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_logout(config_path: &Path, auth_path: &Path, account: Option<String>) -> Result<()> {
+    let account = resolve_account(account)?;
+    let config = load_corrected_config(config_path)?;
+    let manager = AccountManager::new(config, auth_path.to_path_buf())?;
+    if manager.logout(&account).await? {
+        println!("account {account:?} was logged out and disabled");
+    } else {
+        println!("account {account:?} does not exist; nothing changed");
+    }
+    Ok(())
+}
+
+async fn cmd_serve(config_path: &Path, auth_path: &Path) -> Result<()> {
+    let config = load_corrected_config(config_path)?;
+    let manager = AccountManager::new(config.clone(), auth_path.to_path_buf())?;
+    if !manager.has_usable_account().await? {
+        bail!("no enabled authenticated account; run mogick-provider login --account <name>");
+    }
+    println!("mogick-provider listening on http://{}", config.server.bind);
+    println!(
+        "forwarding /v1/* to {}{}/*",
+        config.upstream.base_url, config.upstream.api_prefix
+    );
+    println!(
+        "background balance poll: every {}s",
+        config.runtime.balance_poll_secs
+    );
+    let background = manager.clone();
+    tokio::spawn(async move { background.background_loop().await });
+    server::serve(AppState::new(config, manager)?).await
+}
+
+fn load_corrected_config(path: &Path) -> Result<Config> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    let before: Config =
+        serde_json::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
+    let mut after = before.clone();
+    after.apply_defaults();
+    if before != after {
+        after.save(path)?;
+        println!("auto-corrected runtime defaults in {}", path.display());
+    }
+    Ok(after)
+}
+
+fn resolve_account(account: Option<String>) -> Result<String> {
+    if let Some(account) = account.map(|name| name.trim().to_string()) {
+        if !account.is_empty() {
+            return Ok(account);
+        }
+    }
+    print!("Account name: ");
+    io::stdout().flush().context("flushing account prompt")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("reading account name")?;
+    let account = input.trim().to_string();
+    if account.is_empty() {
+        bail!("account name cannot be empty");
+    }
+    Ok(account)
+}
+
+fn open_browser(url: &str) -> io::Result<()> {
     #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-    }
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
     #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-    }
+    std::process::Command::new("open")
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
     #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-    }
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
     Ok(())
 }

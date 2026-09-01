@@ -1,357 +1,541 @@
-//! Token manager: persists the active access/refresh tokens and refreshes
-//! them transparently before they expire.
-//!
-//! All access from the HTTP server goes through [`TokenManager::current_token`].
-//! If the cached access token is missing or about to expire, the manager
-//! blocks on a single in-flight refresh so concurrent requests share one
-//! round trip to the IdP.
-//!
-//! Also exposes [`TokenManager::background_loop`] which spawns a tokio task
-//! that:
-//!   1. Calls `/api/v1/user/balance` every `BALANCE_POLL_SECS` seconds
-//!      (default 180 = 3 min, matching what Mogick's "balance gate" does).
-//!      This both keeps the session warm on the IdP side and surfaces the
-//!      remaining quota to the operator in the proxy logs.
-//!   2. Triggers an explicit refresh whenever the cached access token is
-//!      about to expire (`REFRESH_SKEW_SECS` seconds early), so callers
-//!      served via [`current_token`] never have to wait.
+//! Multi-account selection, isolated refresh locks, and balance probing.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::config::{Config, TokenState};
-use crate::oauth::{refresh_access_token, TokenResponse};
+use crate::config::{provider_oauth, AccountAuth, AuthErrorRecord, AuthStore, Config, OAuthConfig};
+use crate::oauth::{is_permanent_refresh_error, refresh_access_token, TokenResponse};
 
-/// Refresh tokens this many seconds early to absorb clock skew / network jitter.
-const REFRESH_SKEW_SECS: i64 = 60;
-
-/// Background balance poll cadence. Mogick's "balance gate" runs at the
-/// same cadence (`mogick.network.balance.gate_*` metrics fire on this
-/// schedule); matching it makes the proxy behave like a native client.
-pub const BALANCE_POLL_SECS: u64 = 180;
-
-/// Flat balance fields — matches the `subscription.UserBalance` shape
-/// found in `mogick.exe`. Used as the `data` field of the upstream's
-/// `{ "code": 0, "data": UserBalance }` envelope.
-#[derive(Debug, Deserialize)]
-struct BalanceData {
-    #[serde(default)]
-    total_balance: Option<serde_json::Value>,
-    #[serde(default)]
-    balance: Option<serde_json::Value>,
-    #[serde(default)]
-    free_balance: Option<serde_json::Value>,
-    #[serde(default)]
-    plan_balance: Option<serde_json::Value>,
-}
-
-/// `{ "code": 0, "data": ... }` envelope used by Mogick's keystone_iam
-/// upstream responses.
-#[derive(Debug, Deserialize)]
-struct BalanceEnvelope {
-    code: i32,
-    data: BalanceData,
+#[derive(Debug, Clone)]
+pub struct SelectedAccount {
+    pub name: String,
+    pub access_token: String,
+    pub refreshed: bool,
 }
 
 #[derive(Clone)]
-pub struct TokenManager {
+pub struct AccountManager {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    config_path: PathBuf,
-    /// Held while a refresh is in progress so concurrent callers wait.
-    refresh_lock: Mutex<()>,
+    config: Config,
+    oauth: OAuthConfig,
+    auth_path: PathBuf,
     http: reqwest::Client,
+    store_lock: Mutex<()>,
+    account_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    last_used_clock: AtomicI64,
 }
 
-impl TokenManager {
-    pub fn new(config_path: PathBuf) -> Self {
+#[derive(Debug, Deserialize)]
+struct BalanceEnvelope {
+    #[serde(default)]
+    code: serde_json::Value,
+    #[serde(default)]
+    data: serde_json::Value,
+}
+
+impl AccountManager {
+    pub fn new(config: Config, auth_path: PathBuf) -> Result<Self> {
+        Self::new_with_oauth(config, auth_path, provider_oauth())
+    }
+
+    pub(crate) fn new_with_oauth(
+        config: Config,
+        auth_path: PathBuf,
+        oauth: OAuthConfig,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(config.upstream.timeout_secs))
             .build()
-            .expect("building reqwest client");
-        Self {
+            .context("building account HTTP client")?;
+        Ok(Self {
             inner: Arc::new(Inner {
-                config_path,
-                refresh_lock: Mutex::new(()),
+                config,
+                oauth,
+                auth_path,
                 http,
+                store_lock: Mutex::new(()),
+                account_locks: Mutex::new(HashMap::new()),
+                last_used_clock: AtomicI64::new(Utc::now().timestamp_millis()),
             }),
-        }
+        })
     }
 
-    /// Return a valid access token, refreshing if needed.
-    pub async fn current_token(&self) -> Result<String> {
-        // First quick check: if the cached token is fine, skip the lock entirely.
-        {
-            let cfg = Config::load(&self.inner.config_path)?;
-            if let Some(key) = cfg.upstream.static_api_key.clone() {
-                if !key.is_empty() {
-                    return Ok(key);
-                }
+    pub async fn pick_account(&self, excluded: &HashSet<String>) -> Result<SelectedAccount> {
+        let name = {
+            let _guard = self.inner.store_lock.lock().await;
+            let mut auth = AuthStore::load(&self.inner.auth_path)?;
+            let name = auth
+                .accounts
+                .iter()
+                .filter(|(name, account)| account.usable() && !excluded.contains(*name))
+                .min_by(|(left_name, left), (right_name, right)| {
+                    (left.last_used, left_name.as_str())
+                        .cmp(&(right.last_used, right_name.as_str()))
+                })
+                .map(|(name, _)| name.clone())
+                .ok_or_else(|| anyhow!("no enabled authenticated accounts are available"))?;
+            let timestamp = self.next_last_used();
+            if let Some(account) = auth.accounts.get_mut(&name) {
+                account.last_used = timestamp;
             }
-            if !cfg.tokens.needs_refresh(REFRESH_SKEW_SECS) {
-                return Ok(cfg.tokens.access_token);
-            }
+            auth.save(&self.inner.auth_path)?;
+            name
+        };
+        self.current_token_for(&name, false).await
+    }
+
+    pub async fn current_token_for(&self, name: &str, force: bool) -> Result<SelectedAccount> {
+        let lock = self.account_lock(name).await;
+        let _account_guard = lock.lock().await;
+
+        let account = {
+            let _guard = self.inner.store_lock.lock().await;
+            AuthStore::load(&self.inner.auth_path)?
+                .accounts
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("account {name:?} does not exist"))?
+        };
+        if !account.usable() {
+            bail!("account {name:?} is disabled or requires login");
+        }
+        if !force && !account.needs_refresh(self.inner.config.runtime.refresh_skew_secs) {
+            return Ok(SelectedAccount {
+                name: name.into(),
+                access_token: account.access_token,
+                refreshed: false,
+            });
+        }
+        if account.refresh_token.is_empty() {
+            self.mark_reauth_locked(name, "refresh token is unavailable")
+                .await?;
+            bail!("account {name:?} requires login");
         }
 
-        // Slow path: serialise refresh attempts.
-        let _guard = self.inner.refresh_lock.lock().await;
-        // Re-check inside the lock — another worker may have refreshed already.
-        {
-            let cfg = Config::load(&self.inner.config_path)?;
-            if !cfg.tokens.needs_refresh(REFRESH_SKEW_SECS) {
-                return Ok(cfg.tokens.access_token);
-            }
-            if cfg.tokens.refresh_token.is_empty() {
-                return Err(anyhow!(
-                    "no refresh_token available — run `mogick-proxy login` first"
-                ));
-            }
-            match refresh_access_token(
-                &self.inner.http,
-                &cfg.oauth,
-                &cfg.tokens.refresh_token,
-            )
+        match refresh_access_token(&self.inner.http, &self.inner.oauth, &account.refresh_token)
             .await
-            {
-                Ok(new) => self.persist_new_tokens(&cfg.tokens, new)?,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("refresh")
-                        || msg.contains("not_supported")
-                        || msg.contains("invalid_grant")
-                    {
-                        return Err(anyhow!(
-                            "refresh failed ({}). Re-run `mogick-proxy login --force` to re-authenticate",
-                            msg
-                        ));
-                    }
-                    return Err(e.context("refreshing access token"));
-                }
+        {
+            Ok(response) => {
+                let access_token = response.access_token.clone();
+                self.persist_refreshed_locked(name, &account, response)
+                    .await?;
+                Ok(SelectedAccount {
+                    name: name.into(),
+                    access_token,
+                    refreshed: true,
+                })
+            }
+            Err(error) => {
+                let permanent = is_permanent_refresh_error(&error);
+                self.record_refresh_error_locked(name, permanent, &error)
+                    .await?;
+                Err(error.context(format!("refreshing account {name:?}")))
             }
         }
-        let cfg = Config::load(&self.inner.config_path)?;
-        Ok(cfg.tokens.access_token)
     }
 
-    /// Force a refresh now, regardless of expiry. Used by the background
-    /// loop to refresh opportunistically when the balance probe indicates
-    /// the token may have been rotated by the IdP.
-    pub async fn force_refresh(&self) -> Result<()> {
-        let _guard = self.inner.refresh_lock.lock().await;
-        let cfg = Config::load(&self.inner.config_path)?;
-        if cfg.tokens.refresh_token.is_empty() {
-            return Err(anyhow!("no refresh_token to use"));
-        }
-        let new = refresh_access_token(
-            &self.inner.http,
-            &cfg.oauth,
-            &cfg.tokens.refresh_token,
-        )
-        .await
-        .context("refreshing access token")?;
-        self.persist_new_tokens(&cfg.tokens, new)?;
-        Ok(())
+    pub async fn force_refresh(&self, name: &str) -> Result<SelectedAccount> {
+        self.current_token_for(name, true).await
     }
 
-    /// Persist the result of a brand-new device-code login. Replaces any
-    /// previously stored tokens.
-    pub fn store_initial_tokens(&self, resp: &TokenResponse) -> Result<()> {
-        let mut cfg = Config::load(&self.inner.config_path)?;
-        cfg.tokens = tokens_from_response(resp, &cfg.tokens.refresh_token);
-        cfg.save(&self.inner.config_path)?;
-        Ok(())
+    pub async fn mark_unauthorized(&self, name: &str) -> Result<()> {
+        let lock = self.account_lock(name).await;
+        let _account_guard = lock.lock().await;
+        self.mark_reauth_locked(name, "upstream rejected refreshed credentials")
+            .await
     }
 
-    fn persist_new_tokens(
-        &self,
-        prev: &TokenState,
-        resp: TokenResponse,
-    ) -> Result<()> {
-        let mut cfg = Config::load(&self.inner.config_path)?;
-        let refresh_token = resp
-            .refresh_token
-            .clone()
-            .unwrap_or_else(|| prev.refresh_token.clone());
-        let new_expiry = compute_expires_at(resp.expires_in);
-        cfg.tokens = TokenState {
-            access_token: resp.access_token,
-            refresh_token,
-            expires_at: new_expiry,
-            token_type: resp
-                .token_type
-                .unwrap_or_else(|| "Bearer".to_string()),
-            scope: resp.scope.unwrap_or_else(|| prev.scope.clone()),
-        };
-        cfg.save(&self.inner.config_path)?;
-        tracing::info!(
-            expires_at = new_expiry,
-            "access token refreshed and persisted"
-        );
-        Ok(())
+    pub async fn store_login(&self, name: &str, response: &TokenResponse) -> Result<()> {
+        let lock = self.account_lock(name).await;
+        let _account_guard = lock.lock().await;
+        let _guard = self.inner.store_lock.lock().await;
+        let mut auth = AuthStore::load(&self.inner.auth_path)?;
+        let previous_refresh = auth
+            .accounts
+            .get(name)
+            .map(|account| account.refresh_token.as_str())
+            .unwrap_or_default();
+        let account = account_from_response(response, previous_refresh);
+        auth.accounts.insert(name.into(), account);
+        auth.save(&self.inner.auth_path)
     }
 
-    /// Drop all stored tokens (logout).
-    pub fn clear(&self) -> Result<()> {
-        let mut cfg = Config::load(&self.inner.config_path)?;
-        cfg.tokens = TokenState::default();
-        cfg.save(&self.inner.config_path)?;
-        Ok(())
-    }
-
-    /// Read-only view of the current token state (for `status` subcommand).
-    pub fn snapshot(&self) -> Result<TokenState> {
-        Ok(Config::load(&self.inner.config_path)?.tokens)
-    }
-
-    /// Run the background loop until the process is killed. The loop:
-    ///  * sleeps for `BALANCE_POLL_SECS`
-    ///  * fetches the user balance (logs it, no-op on errors)
-    ///  * if the cached access token is near expiry, kicks off a refresh
-    pub async fn background_loop(self) {
-        tracing::info!(
-            cadence_secs = BALANCE_POLL_SECS,
-            "background balance+refresh loop starting"
-        );
-        loop {
-            // First, opportunistically refresh if needed.
-            match self.try_refresh_if_needed().await {
-                Ok(true) => tracing::info!("background: refresh done"),
-                Ok(false) => {}
-                Err(e) => tracing::warn!(error=%e, "background: refresh failed"),
-            }
-
-            // Then probe the balance endpoint.
-            match self.probe_balance().await {
-                Ok(summary) => tracing::info!(balance=%summary, "balance probe ok"),
-                Err(e) => tracing::debug!(error=%e, "balance probe failed"),
-            }
-
-            tokio::time::sleep(Duration::from_secs(BALANCE_POLL_SECS)).await;
-        }
-    }
-
-    /// Returns Ok(true) when a refresh was performed.
-    async fn try_refresh_if_needed(&self) -> Result<bool> {
-        let needs = {
-            let cfg = Config::load(&self.inner.config_path)?;
-            cfg.tokens.needs_refresh(REFRESH_SKEW_SECS)
-                && !cfg.tokens.refresh_token.is_empty()
-        };
-        if !needs {
+    pub async fn logout(&self, name: &str) -> Result<bool> {
+        let lock = self.account_lock(name).await;
+        let _account_guard = lock.lock().await;
+        let _guard = self.inner.store_lock.lock().await;
+        let mut auth = AuthStore::load(&self.inner.auth_path)?;
+        let Some(account) = auth.accounts.get_mut(name) else {
             return Ok(false);
-        }
-        self.force_refresh().await?;
+        };
+        account.access_token.clear();
+        account.refresh_token.clear();
+        account.token_expiry = 0;
+        account.enabled = false;
+        account.reauth_required = false;
+        account.last_error = None;
+        auth.save(&self.inner.auth_path)?;
         Ok(true)
     }
 
-    /// Probe `/api/v1/user/balance` and return a short human-readable
-    /// summary. Errors are non-fatal — the operator can see the failure
-    /// in the proxy logs and act on it.
-    async fn probe_balance(&self) -> Result<String> {
-        let cfg = Config::load(&self.inner.config_path)?;
-        // Skip when using a static API key (no balance concept).
-        if let Some(k) = cfg.upstream.static_api_key.as_ref() {
-            if !k.is_empty() {
-                return Ok("(static api key in use — balance probe skipped)".into());
-            }
-        }
-        if cfg.tokens.access_token.is_empty() {
-            return Err(anyhow!("no access token"));
-        }
-        let url = format!(
-            "{}/api/v1/user/balance",
-            cfg.upstream.base_url.trim_end_matches('/')
+    pub async fn snapshots(&self) -> Result<AuthStore> {
+        let _guard = self.inner.store_lock.lock().await;
+        AuthStore::load(&self.inner.auth_path)
+    }
+
+    pub async fn has_usable_account(&self) -> Result<bool> {
+        Ok(self
+            .snapshots()
+            .await?
+            .accounts
+            .values()
+            .any(AccountAuth::usable))
+    }
+
+    pub async fn background_loop(self) {
+        let cadence = Duration::from_secs(self.inner.config.runtime.balance_poll_secs);
+        tracing::info!(
+            balance_poll_secs = cadence.as_secs(),
+            "background account maintenance started"
         );
-        // The copilot upstream requires `X-App-Id: mogick` on every
-        // authenticated request; without it the upstream returns
-        // `INVALID_OAUTH_TOKEN` even with a valid JWT.
-        let x_app_id = crate::config::defaults::UPSTREAM_X_APP_ID.to_string();
-        let resp = self
-            .inner
-            .http
-            .get(&url)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", cfg.tokens.access_token))
-            .header("X-App-Id", x_app_id)
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
-            .context("GET user/balance")?;
-
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            // Special-case: the upstream returns 404 ACCOUNT_NOT_FOUND
-            // for free-tier accounts that have never activated billing.
-            // That's a normal state, not an error — log it as info
-            // instead of an `Err` to keep logs clean.
-            if status.as_u16() == 404 && body.contains("ACCOUNT_NOT_FOUND") {
-                tracing::info!(
-                    "balance probe: account has no billing record (free tier) — skipping"
-                );
-                return Ok("(no billing record on this account)".into());
+        loop {
+            if let Err(error) = self.maintain_all_accounts().await {
+                tracing::warn!(error = %safe_error(&error), "account maintenance pass failed");
             }
-            return Err(anyhow!(
-                "user/balance HTTP {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            ));
+            tokio::time::sleep(cadence).await;
         }
+    }
 
-        // The upstream wraps responses in `{ "code": 0, "data": ... }`.
-        // Try the wrapped shape first, then fall back to flat.
-        let summary = if let Ok(w) = serde_json::from_str::<BalanceEnvelope>(&body) {
-            if w.code != 0 {
-                return Err(anyhow!("user/balance code={}", w.code));
+    async fn maintain_all_accounts(&self) -> Result<()> {
+        let accounts: Vec<(String, AccountAuth)> = self
+            .snapshots()
+            .await?
+            .accounts
+            .into_iter()
+            .filter(|(_, account)| account.usable())
+            .collect();
+        for (name, account) in accounts {
+            if account.needs_refresh(self.inner.config.runtime.refresh_skew_secs) {
+                match self.current_token_for(&name, false).await {
+                    Ok(selected) => {
+                        tracing::info!(account = %name, refresh = selected.refreshed, "background refresh complete");
+                    }
+                    Err(error) => {
+                        tracing::warn!(account = %name, error = %safe_error(&error), "background refresh failed");
+                        continue;
+                    }
+                }
             }
-            format_balance(&w.data)
-        } else if let Ok(f) = serde_json::from_str::<BalanceData>(&body) {
-            format_balance(&f)
-        } else {
-            return Err(anyhow!("user/balance: unrecognised response shape"));
+            match self.probe_balance(&name).await {
+                Ok(BalanceResult::FreeTier) => {
+                    tracing::info!(account = %name, balance_result = "free_tier", "balance probe complete");
+                }
+                Ok(BalanceResult::Available(summary)) => {
+                    tracing::info!(account = %name, balance_result = "available", balance = %summary, "balance probe complete");
+                }
+                Err(error) => {
+                    tracing::warn!(account = %name, balance_result = "error", error = %safe_error(&error), "balance probe failed");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn probe_balance(&self, name: &str) -> Result<BalanceResult> {
+        let selected = self.current_token_for(name, false).await?;
+        let url = format!(
+            "{}{}/user/balance",
+            self.inner.config.upstream.base_url.trim_end_matches('/'),
+            self.inner.config.upstream.api_prefix
+        );
+        let mut request = self.inner.http.get(url).bearer_auth(selected.access_token);
+        for (key, value) in &self.inner.config.upstream.extra_headers {
+            if !is_reserved_upstream_header(key) {
+                request = request.header(key, value);
+            }
+        }
+        request = request.header("X-App-Id", crate::config::defaults::UPSTREAM_X_APP_ID);
+        let response = request.send().await.context("requesting user balance")?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status.as_u16() == 404 && body.contains("ACCOUNT_NOT_FOUND") {
+            return Ok(BalanceResult::FreeTier);
+        }
+        if !status.is_success() {
+            bail!("balance endpoint returned HTTP {status}");
+        }
+        let envelope: BalanceEnvelope =
+            serde_json::from_str(&body).context("parsing balance response")?;
+        if !envelope.code.is_null() && envelope.code.as_i64() != Some(0) {
+            bail!("balance endpoint returned a business error");
+        }
+        Ok(BalanceResult::Available(balance_summary(&envelope.data)))
+    }
+
+    async fn persist_refreshed_locked(
+        &self,
+        name: &str,
+        previous: &AccountAuth,
+        response: TokenResponse,
+    ) -> Result<()> {
+        let _guard = self.inner.store_lock.lock().await;
+        let mut auth = AuthStore::load(&self.inner.auth_path)?;
+        let current = auth
+            .accounts
+            .get_mut(name)
+            .ok_or_else(|| anyhow!("account disappeared during refresh"))?;
+        current.access_token = response.access_token;
+        current.refresh_token = response
+            .refresh_token
+            .unwrap_or_else(|| previous.refresh_token.clone());
+        current.token_expiry = expires_at(response.expires_in);
+        current.token_type = response.token_type.unwrap_or_else(|| "Bearer".into());
+        current.scope = response.scope.unwrap_or_else(|| previous.scope.clone());
+        current.enabled = true;
+        current.reauth_required = false;
+        current.last_error = None;
+        auth.save(&self.inner.auth_path)
+    }
+
+    async fn record_refresh_error_locked(
+        &self,
+        name: &str,
+        permanent: bool,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let _guard = self.inner.store_lock.lock().await;
+        let mut auth = AuthStore::load(&self.inner.auth_path)?;
+        if let Some(account) = auth.accounts.get_mut(name) {
+            account.reauth_required |= permanent;
+            account.last_error = Some(AuthErrorRecord {
+                at: Utc::now().timestamp(),
+                message: safe_error(error),
+            });
+        }
+        auth.save(&self.inner.auth_path)
+    }
+
+    async fn mark_reauth_locked(&self, name: &str, message: &str) -> Result<()> {
+        let _guard = self.inner.store_lock.lock().await;
+        let mut auth = AuthStore::load(&self.inner.auth_path)?;
+        if let Some(account) = auth.accounts.get_mut(name) {
+            account.reauth_required = true;
+            account.last_error = Some(AuthErrorRecord {
+                at: Utc::now().timestamp(),
+                message: message.into(),
+            });
+        }
+        auth.save(&self.inner.auth_path)
+    }
+
+    async fn account_lock(&self, name: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.inner.account_locks.lock().await;
+        locks
+            .entry(name.into())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn next_last_used(&self) -> i64 {
+        let now = Utc::now().timestamp_millis();
+        let mut previous = self.inner.last_used_clock.load(Ordering::Relaxed);
+        loop {
+            let next = now.max(previous.saturating_add(1));
+            match self.inner.last_used_clock.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => previous = actual,
+            }
+        }
+    }
+}
+
+enum BalanceResult {
+    FreeTier,
+    Available(String),
+}
+
+fn account_from_response(response: &TokenResponse, previous_refresh: &str) -> AccountAuth {
+    AccountAuth {
+        access_token: response.access_token.clone(),
+        refresh_token: response
+            .refresh_token
+            .clone()
+            .unwrap_or_else(|| previous_refresh.into()),
+        token_expiry: expires_at(response.expires_in),
+        token_type: response
+            .token_type
+            .clone()
+            .unwrap_or_else(|| "Bearer".into()),
+        scope: response.scope.clone().unwrap_or_default(),
+        enabled: true,
+        last_used: 0,
+        reauth_required: false,
+        last_error: None,
+    }
+}
+
+fn expires_at(expires_in: Option<i64>) -> i64 {
+    Utc::now().timestamp() + expires_in.unwrap_or(3600).max(1)
+}
+
+fn safe_error(error: &anyhow::Error) -> String {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("invalid_grant") {
+        "invalid_grant; login required".into()
+    } else if message.contains("timeout") {
+        "request timed out".into()
+    } else if message.contains("connect") {
+        "connection failed".into()
+    } else if message.contains("refresh") {
+        "token refresh failed".into()
+    } else {
+        "upstream operation failed".into()
+    }
+}
+
+fn balance_summary(value: &serde_json::Value) -> String {
+    let Some(object) = value.as_object() else {
+        return "available".into();
+    };
+    ["balance", "total_balance", "free_balance", "plan_balance"]
+        .into_iter()
+        .filter_map(|key| object.get(key).map(|value| format!("{key}={value}")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_reserved_upstream_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "cookie" | "host" | "content-length" | "x-app-id"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    fn auth_path() -> PathBuf {
+        std::env::temp_dir().join(format!("mogick-auth-{}.json", uuid::Uuid::new_v4()))
+    }
+
+    fn fresh_account(token: &str, last_used: i64) -> AccountAuth {
+        AccountAuth {
+            access_token: token.into(),
+            refresh_token: "refresh".into(),
+            token_expiry: Utc::now().timestamp() + 3600,
+            token_type: "Bearer".into(),
+            enabled: true,
+            last_used,
+            ..AccountAuth::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn fair_selection_and_logout_skip() {
+        let path = auth_path();
+        let mut auth = AuthStore::default();
+        auth.accounts.insert("alice".into(), fresh_account("a", 0));
+        auth.accounts.insert("bob".into(), fresh_account("b", 0));
+        auth.save(&path).unwrap();
+        let manager = AccountManager::new(Config::default(), path.clone()).unwrap();
+        let excluded = HashSet::new();
+        assert_eq!(manager.pick_account(&excluded).await.unwrap().name, "alice");
+        assert_eq!(manager.pick_account(&excluded).await.unwrap().name, "bob");
+        assert_eq!(manager.pick_account(&excluded).await.unwrap().name, "alice");
+        assert!(manager.logout("alice").await.unwrap());
+        assert_eq!(manager.pick_account(&excluded).await.unwrap().name, "bob");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_share_one_refresh_and_persist_rotation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        async fn refresh_handler(
+            State(calls): State<Arc<AtomicUsize>>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            calls.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "access_token":"new-access",
+                    "refresh_token":"rotated-refresh",
+                    "expires_in":3600
+                })),
+            )
+        }
+        let app = Router::new()
+            .route("/token", post(refresh_handler))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let path = auth_path();
+        let mut auth = AuthStore::default();
+        auth.accounts.insert(
+            "alice".into(),
+            AccountAuth {
+                access_token: "expired".into(),
+                refresh_token: "old-refresh".into(),
+                token_expiry: 1,
+                enabled: true,
+                ..AccountAuth::default()
+            },
+        );
+        auth.save(&path).unwrap();
+        let oauth = OAuthConfig {
+            client_id: "mogick".into(),
+            device_authorization_endpoint: format!("http://{address}/device"),
+            token_endpoint: format!("http://{address}/token"),
+            scope: "openid profile email".into(),
         };
-        Ok(summary)
+        let manager =
+            AccountManager::new_with_oauth(Config::default(), path.clone(), oauth).unwrap();
+        let tasks: Vec<_> = (0..12)
+            .map(|_| {
+                let manager = manager.clone();
+                tokio::spawn(
+                    async move { manager.current_token_for("alice", false).await.unwrap() },
+                )
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.unwrap().access_token, "new-access");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let stored = AuthStore::load(&path).unwrap();
+        assert_eq!(stored.accounts["alice"].refresh_token, "rotated-refresh");
+        server.abort();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stored_error_is_redacted() {
+        let error = anyhow!("Bearer abc.def.ghi invalid_grant refresh_token=secret");
+        assert_eq!(safe_error(&error), "invalid_grant; login required");
     }
 }
-
-fn format_balance(f: &BalanceData) -> String {
-    let total = f.total_balance.as_ref().map(|v| v.to_string()).unwrap_or_default();
-    let bal = f.balance.as_ref().map(|v| v.to_string()).unwrap_or_default();
-    let free = f.free_balance.as_ref().map(|v| v.to_string()).unwrap_or_default();
-    let plan = f.plan_balance.as_ref().map(|v| v.to_string()).unwrap_or_default();
-    let mut parts = Vec::new();
-    if !bal.is_empty() { parts.push(format!("balance={}", bal)); }
-    if !total.is_empty() { parts.push(format!("total={}", total)); }
-    if !free.is_empty() { parts.push(format!("free={}", free)); }
-    if !plan.is_empty() { parts.push(format!("plan={}", plan)); }
-    if parts.is_empty() { "(empty)".into() } else { parts.join(" ") }
-}
-
-fn tokens_from_response(resp: &TokenResponse, prev_refresh: &str) -> TokenState {
-    let refresh_token = resp
-        .refresh_token
-        .clone()
-        .unwrap_or_else(|| prev_refresh.to_string());
-    TokenState {
-        access_token: resp.access_token.clone(),
-        refresh_token,
-        expires_at: compute_expires_at(resp.expires_in),
-        token_type: resp.token_type.clone().unwrap_or_else(|| "Bearer".into()),
-        scope: resp.scope.clone().unwrap_or_default(),
-    }
-}
-
-fn compute_expires_at(expires_in: Option<i64>) -> i64 {
-    let secs = expires_in.unwrap_or(3600).max(1);
-    Utc::now().timestamp() + secs
-}
-
-use anyhow::Context as _;

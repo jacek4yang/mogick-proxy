@@ -3,26 +3,19 @@
     "bind": "127.0.0.1:8787",
     "api_key": ""
   },
-  "oauth": {
-    "client_id": "mogick-proxy",
-    "client_secret": null,
-    "device_authorization_endpoint": "https://login.tongyuan.cc/oauth2/device",
-    "token_endpoint": "https://login.tongyuan.cc/oauth2/token",
-    "scope": "openid profile email offline_access",
-    "audience": null
-  },
   "upstream": {
-    "base_url": "https://api.tongyuan.cc/v1",
-    "chat_path": "/chat/completions",
-    "static_api_key": null,
-    "extra_headers": {},
-    "timeout_secs": 120
+    "base_url": "https://copilot.tongyuan.cc",
+    "api_prefix": "/api/v1",
+    "timeout_secs": 120,
+    "extra_headers": {
+      "X-App-Id": "mogick"
+    }
   },
-  "tokens": {
-    "access_token": "",
-    "refresh_token": "",
-    "expires_at": 0,
-    "token_type": "",
-    "scope": ""
+  "runtime": {
+    "refresh_skew_secs": 60,
+    "balance_poll_secs": 180,
+    "max_request_bytes": 33554432,
+    "log_level": "info",
+    "log_format": "pretty"
   }
 }

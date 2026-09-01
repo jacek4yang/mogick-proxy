@@ -1,338 +1,518 @@
-//! Configuration types persisted as JSON on disk.
-//!
-//! The config file holds both the *static* OAuth client / upstream
-//! configuration and the *dynamic* token state. The two halves live
-//! under different top-level keys so static config can be checked
-//! into version control while the token state stays local-only.
-//!
-//! All OAuth fields except `oauth` itself have hard-coded defaults
-//! reverse-engineered from the Mogick binary
-//! (`tongyuan.cc/ai/mogick/oauth/keystone.go` + `oauth/deviceflow.go`).
-//! Strings inside the binary confirmed:
-//!   - `https://login.tongyuan.cc/authentication/oauth2`
-//!   - `keystone_iam: requesting device code`
-//!   - `keystone_iam: token obtained`
-//!   - `keystone_iam token refresh is not supported, please run 'mogick setup' to re-authenticate`
-//! So a fresh `mogick-proxy login` works out of the box on a default
-//! `config.json` — no manual setup needed.
+//! Runtime configuration, secure credential storage, and legacy migration.
 
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// OAuth endpoints + client_id reverse-engineered from the **Windows
-/// production** Mogick binary
-/// (`mogick-windows-x64.zip` -> `mogick.exe`, SHA256 `…`) and confirmed
-/// live against the IdP.
-///
-/// Live confirmation with `curl`:
-/// ```text
-/// POST https://login.tongyuan.cc/authentication/oauth2/device/code
-///   client_id=mogick
-///   scope=openid profile email
-/// =>
-/// {
-///   "device_code":"6KJfS8tIAb_Gc9npv-Yml1sor-90UD24QE0iV9eiHKI",
-///   "user_code":"YPPA-2E55",
-///   "verification_uri":"https://login.tongyuan.cc/device",
-///   "verification_uri_complete":"https://login.tongyuan.cc/device?user_code=YPPA-2E55",
-///   "expires_in":1800,
-///   "interval":5
-/// }
-/// ```
 pub mod defaults {
-    /// OAuth 2.0 client identifier. Confirmed live-accepted by the IdP
-    /// (this is **not** `mogick-cli`, which appears in the binary only
-    /// as a build-time CLI product string — `mogick-cli` returns
-    /// `invalid_client` from the live IdP).
     pub const OAUTH_CLIENT_ID: &str = "mogick";
-
-    /// Device authorization endpoint (RFC 8628). Confirmed live-accepted.
-    /// Note the path is `/device/code`, not `/device_authorization`.
     pub const DEVICE_AUTHORIZATION_ENDPOINT: &str =
         "https://login.tongyuan.cc/authentication/oauth2/device/code";
-
-    /// Token endpoint (the same URL is used for device-code polling
-    /// and for refresh_token exchange).
-    pub const TOKEN_ENDPOINT: &str =
-        "https://login.tongyuan.cc/authentication/oauth2/token";
-
-    /// Userinfo endpoint (kept for reference).
-    #[allow(dead_code)]
-    pub const USERINFO_ENDPOINT: &str =
-        "https://login.tongyuan.cc/authentication/userinfo";
-
-    /// OAuth scope the IdP expects. Confirmed live-accepted.
+    pub const TOKEN_ENDPOINT: &str = "https://login.tongyuan.cc/authentication/oauth2/token";
     pub const OAUTH_SCOPE: &str = "openid profile email";
-
-    /// The upstream LLM API base (no trailing slash). Mogick's runtime
-    /// profile points at `https://copilot.tongyuan.cc`, **not**
-    /// `https://api.tongyuan.cc`. Confirmed by capturing mogick.exe's
-    /// actual outbound HTTP request via `--verbose`:
-    ///   `llmclient: outbound request url=https://copilot.tongyuan.cc/api/v1/chat/completions`
-    /// Both the JWT access_token AND the `X-App-Id: mogick` header are
-    /// required by this upstream.
     pub const UPSTREAM_BASE_URL: &str = "https://copilot.tongyuan.cc";
-
-    /// Chat completion path appended to `UPSTREAM_BASE_URL`.
-    pub const UPSTREAM_CHAT_PATH: &str = "/api/v1/chat/completions";
-
-    /// `X-App-Id` header value. Required by the tongyuan copilot
-    /// upstream; without it the upstream returns
-    /// `INVALID_OAUTH_TOKEN` even with a valid JWT.
+    pub const UPSTREAM_API_PREFIX: &str = "/api/v1";
     pub const UPSTREAM_X_APP_ID: &str = "mogick";
-
-    /// Default bind address for the reverse proxy.
     pub const SERVER_BIND: &str = "127.0.0.1:8787";
+    pub const BALANCE_POLL_SECS: u64 = 180;
+    pub const REFRESH_SKEW_SECS: i64 = 60;
+    pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 }
 
-/// Top-level config file schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Provider-owned OAuth settings are deliberately not configurable or persisted.
+#[derive(Debug, Clone)]
+pub struct OAuthConfig {
+    pub client_id: String,
+    pub device_authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub scope: String,
+}
+
+pub fn provider_oauth() -> OAuthConfig {
+    OAuthConfig {
+        client_id: defaults::OAUTH_CLIENT_ID.into(),
+        device_authorization_endpoint: defaults::DEVICE_AUTHORIZATION_ENDPOINT.into(),
+        token_endpoint: defaults::TOKEN_ENDPOINT.into(),
+        scope: defaults::OAUTH_SCOPE.into(),
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Config {
-    /// Static, user-provided configuration.
-    #[serde(default)]
     pub server: ServerConfig,
-    /// OAuth provider configuration. Every field has a hard-coded
-    /// default from the IDA dump — missing values are auto-filled.
-    pub oauth: OAuthConfig,
-    /// The upstream LLM API the proxy forwards to.
     pub upstream: UpstreamConfig,
-    /// Dynamic token state. Saved to disk so restarts pick up the
-    /// refresh_token without requiring a fresh interactive login.
-    #[serde(default)]
-    pub tokens: TokenState,
+    pub runtime: RuntimeConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ServerConfig {
-    /// Address the proxy listens on, e.g. `127.0.0.1:8787`.
     pub bind: String,
-    /// Shared secret that callers (mogick, Claude Code via wrapper, ...) must
-    /// present in `Authorization: Bearer <secret>`. Leave empty to disable.
-    #[serde(default)]
     pub api_key: String,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind: defaults::SERVER_BIND.to_string(),
+            bind: defaults::SERVER_BIND.into(),
             api_key: String::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OAuthConfig {
-    /// OAuth 2.0 client_id issued by the IdP.
-    /// Defaults to `defaults::OAUTH_CLIENT_ID` when missing.
-    pub client_id: String,
-    /// Optional client_secret for confidential clients (Device flow
-    /// doesn't need one — Mogick's `mogick` client is public).
-    #[serde(default)]
-    pub client_secret: Option<String>,
-    /// Device authorization endpoint (RFC 8628).
-    /// Defaults to `defaults::DEVICE_AUTHORIZATION_ENDPOINT` when missing.
-    pub device_authorization_endpoint: String,
-    /// Token endpoint. Defaults to `defaults::TOKEN_ENDPOINT` when missing.
-    pub token_endpoint: String,
-    /// Space-separated scope string.
-    #[serde(default)]
-    pub scope: String,
-}
-
-impl OAuthConfig {
-    /// Build an `OAuthConfig` populated with the IDA-extracted defaults.
-    pub fn with_defaults() -> Self {
-        Self {
-            client_id: defaults::OAUTH_CLIENT_ID.into(),
-            client_secret: None,
-            device_authorization_endpoint: defaults::DEVICE_AUTHORIZATION_ENDPOINT.into(),
-            token_endpoint: defaults::TOKEN_ENDPOINT.into(),
-            scope: defaults::OAUTH_SCOPE.into(),
-        }
-    }
-
-    /// Fill in any empty string fields with the IDA defaults so a
-    /// half-written `config.json` still works.
-    pub fn apply_defaults(&mut self) {
-        if self.client_id.is_empty() {
-            self.client_id = defaults::OAUTH_CLIENT_ID.into();
-        }
-        if self.device_authorization_endpoint.is_empty() {
-            self.device_authorization_endpoint = defaults::DEVICE_AUTHORIZATION_ENDPOINT.into();
-        }
-        if self.token_endpoint.is_empty() {
-            self.token_endpoint = defaults::TOKEN_ENDPOINT.into();
-        }
-        if self.scope.is_empty() {
-            self.scope = defaults::OAUTH_SCOPE.into();
-        }
-    }
-}
-
-/// Upstream LLM API the proxy forwards to.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct UpstreamConfig {
-    /// Base URL with no trailing slash, e.g. `https://api.tongyuan.cc/v1`.
-    /// Defaults to `defaults::UPSTREAM_BASE_URL` when missing.
     pub base_url: String,
-    /// Optional path appended to `base_url`. Defaults to `/chat/completions`.
-    #[serde(default = "default_chat_path")]
-    pub chat_path: String,
-    /// Optional hard-coded API key to use instead of the OAuth access token.
-    /// When set, OAuth is bypassed entirely.
-    #[serde(default)]
-    pub static_api_key: Option<String>,
-    /// Extra headers forwarded verbatim to the upstream (e.g. for tenant routing).
-    #[serde(default)]
-    pub extra_headers: std::collections::BTreeMap<String, String>,
-    /// Request timeout in seconds for upstream calls.
-    #[serde(default = "default_timeout")]
+    pub api_prefix: String,
     pub timeout_secs: u64,
+    pub extra_headers: BTreeMap<String, String>,
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        let mut extra_headers = BTreeMap::new();
+        extra_headers.insert("X-App-Id".into(), defaults::UPSTREAM_X_APP_ID.into());
+        Self {
+            base_url: defaults::UPSTREAM_BASE_URL.into(),
+            api_prefix: defaults::UPSTREAM_API_PREFIX.into(),
+            timeout_secs: 120,
+            extra_headers,
+        }
+    }
 }
 
 impl UpstreamConfig {
-    pub fn with_defaults() -> Self {
-        Self {
-            base_url: defaults::UPSTREAM_BASE_URL.into(),
-            chat_path: defaults::UPSTREAM_CHAT_PATH.into(),
-            static_api_key: None,
-            extra_headers: Default::default(),
-            timeout_secs: default_timeout(),
-        }
-    }
-
-    pub fn apply_defaults(&mut self) {
-        // Auto-correct known-bad legacy base URLs to the current
-        // upstream (copilot.tongyuan.cc). The old `api.tongyuan.cc`
-        // host only serves the older mm-* models and rejects the
-        // X-App-Id handshake that copilot.tongyuan.cc requires.
-        let needs_correction = self.base_url.is_empty()
-            || self.base_url.contains("api.tongyuan.cc")
-            || self.base_url.trim_end_matches('/').ends_with("/v1")
-            || self.chat_path.is_empty()
-            || self.chat_path == "/chat/completions";
-        if needs_correction {
+    fn apply_defaults(&mut self) {
+        let legacy_host = self.base_url.contains("api.tongyuan.cc");
+        let legacy_suffix = self.base_url.trim_end_matches('/').ends_with("/v1");
+        if self.base_url.is_empty() || legacy_host || legacy_suffix {
             self.base_url = defaults::UPSTREAM_BASE_URL.into();
-            self.chat_path = defaults::UPSTREAM_CHAT_PATH.into();
         }
-        // Ensure X-App-Id is in extra_headers — required by the
-        // copilot upstream. Don't overwrite if the user set it.
-        let x_app = defaults::UPSTREAM_X_APP_ID;
-        if !self.extra_headers.values().any(|v| v == x_app)
-            && !self.extra_headers.keys().any(|k| k.eq_ignore_ascii_case("X-App-Id"))
+        if self.api_prefix.is_empty() {
+            self.api_prefix = defaults::UPSTREAM_API_PREFIX.into();
+        }
+        self.api_prefix = format!("/{}", self.api_prefix.trim_matches('/'));
+        if self.timeout_secs == 0 {
+            self.timeout_secs = 120;
+        }
+        if !self
+            .extra_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("x-app-id"))
         {
-            self.extra_headers.insert("X-App-Id".to_string(), x_app.to_string());
+            self.extra_headers
+                .insert("X-App-Id".into(), defaults::UPSTREAM_X_APP_ID.into());
         }
     }
 }
 
-fn default_chat_path() -> String {
-    "/chat/completions".to_string()
-}
-fn default_timeout() -> u64 {
-    120
-}
-
-/// Persisted OAuth token state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TokenState {
-    /// Current access token. Empty when no login has happened yet.
-    #[serde(default)]
-    pub access_token: String,
-    /// Refresh token. Used to obtain new access tokens without
-    /// requiring the user to log in again.
-    #[serde(default)]
-    pub refresh_token: String,
-    /// Unix timestamp at which `access_token` expires.
-    #[serde(default)]
-    pub expires_at: i64,
-    /// IdP-provided token type, usually `Bearer`.
-    #[serde(default)]
-    pub token_type: String,
-    /// Space-separated scopes granted by the user.
-    #[serde(default)]
-    pub scope: String,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    Pretty,
+    Json,
 }
 
-impl TokenState {
-    pub fn is_empty(&self) -> bool {
-        self.access_token.is_empty() && self.refresh_token.is_empty()
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    pub refresh_skew_secs: i64,
+    pub balance_poll_secs: u64,
+    pub max_request_bytes: usize,
+    pub log_level: String,
+    pub log_format: LogFormat,
+}
 
-    /// True when no access token is currently valid.
-    pub fn needs_refresh(&self, skew_secs: i64) -> bool {
-        if self.access_token.is_empty() {
-            return true;
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            refresh_skew_secs: defaults::REFRESH_SKEW_SECS,
+            balance_poll_secs: defaults::BALANCE_POLL_SECS,
+            max_request_bytes: defaults::MAX_REQUEST_BYTES,
+            log_level: "info".into(),
+            log_format: LogFormat::Pretty,
         }
-        let now = chrono::Utc::now().timestamp();
-        self.expires_at.saturating_sub(now) <= skew_secs
+    }
+}
+
+impl RuntimeConfig {
+    fn apply_defaults(&mut self) {
+        if self.refresh_skew_secs <= 0 {
+            self.refresh_skew_secs = defaults::REFRESH_SKEW_SECS;
+        }
+        if self.balance_poll_secs == 0 {
+            self.balance_poll_secs = defaults::BALANCE_POLL_SECS;
+        }
+        if self.max_request_bytes == 0 {
+            self.max_request_bytes = defaults::MAX_REQUEST_BYTES;
+        }
+        if self.log_level.trim().is_empty() {
+            self.log_level = "info".into();
+        }
     }
 }
 
 impl Config {
-    /// Load config from `path`, then back-fill any empty OAuth/upstream
-    /// fields with the IDA-extracted defaults. Returns an error only if
-    /// the file is missing or malformed.
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
+        let raw = fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
-        let mut cfg: Config = serde_json::from_str(&raw)
+        let mut config: Self = serde_json::from_str(&raw)
             .with_context(|| format!("parsing config file {}", path.display()))?;
-        cfg.oauth.apply_defaults();
-        cfg.upstream.apply_defaults();
-        Ok(cfg)
+        config.apply_defaults();
+        Ok(config)
     }
 
-    /// Load `path` if it exists, otherwise return a starter config built
-    /// from defaults + a few overrides useful for the most common setup.
     pub fn load_or_default(path: &Path) -> Result<Self> {
         if path.exists() {
-            return Self::load(path);
+            Self::load(path)
+        } else {
+            Ok(Self::default())
         }
-        Ok(Self {
-            server: ServerConfig::default(),
-            oauth: OAuthConfig::with_defaults(),
-            upstream: UpstreamConfig::with_defaults(),
-            tokens: TokenState::default(),
-        })
     }
 
-    /// Atomically save the config back to `path` (write to a temp file then rename).
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating config dir {}", parent.display()))?;
+    pub fn apply_defaults(&mut self) {
+        if self.server.bind.is_empty() {
+            self.server.bind = defaults::SERVER_BIND.into();
         }
-        let body = serde_json::to_string_pretty(self).context("serialising config")?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body)
-            .with_context(|| format!("writing tmp config {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("renaming tmp config to {}", path.display()))?;
-        Ok(())
+        self.upstream.apply_defaults();
+        self.runtime.apply_defaults();
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let body = serde_json::to_vec_pretty(self).context("serializing config")?;
+        atomic_write(path, &body, false)
     }
 }
 
-/// Resolve the default config file path.
-///
-/// Resolution order:
-///   1. `$MOGICK_PROXY_CONFIG` if set and non-empty.
-///   2. `./config.json` in the current working directory.
-///
-/// We deliberately do NOT fall back to a per-user config dir
-/// (e.g. `%APPDATA%/mogick-proxy/config.json` or `~/.config/...`)
-/// because the binary is meant to be run alongside its own
-/// `config.json` — the same file is shared by `init`, `login`,
-/// `serve`, etc. This keeps Windows + Linux behaviour identical
-/// and makes the proxy easy to ship as a portable bundle.
-pub fn default_config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("MOGICK_PROXY_CONFIG") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthStore {
+    pub version: u32,
+    #[serde(default)]
+    pub accounts: BTreeMap<String, AccountAuth>,
+}
+
+impl Default for AuthStore {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            accounts: BTreeMap::new(),
         }
     }
-    PathBuf::from("config.json")
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AccountAuth {
+    pub access_token: String,
+    pub refresh_token: String,
+    #[serde(alias = "expires_at")]
+    pub token_expiry: i64,
+    pub token_type: String,
+    pub scope: String,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    pub last_used: i64,
+    pub reauth_required: bool,
+    pub last_error: Option<AuthErrorRecord>,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+impl AccountAuth {
+    pub fn has_credentials(&self) -> bool {
+        !self.access_token.is_empty() || !self.refresh_token.is_empty()
+    }
+
+    pub fn usable(&self) -> bool {
+        self.enabled && !self.reauth_required && self.has_credentials()
+    }
+
+    pub fn needs_refresh(&self, skew_secs: i64) -> bool {
+        self.access_token.is_empty()
+            || self
+                .token_expiry
+                .saturating_sub(chrono::Utc::now().timestamp())
+                <= skew_secs
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthErrorRecord {
+    pub at: i64,
+    pub message: String,
+}
+
+impl AuthStore {
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("reading auth file {}", path.display()))?;
+        let store: Self = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing auth file {}", path.display()))?;
+        if store.version != 1 {
+            bail!("unsupported auth.json version {}", store.version);
+        }
+        Ok(store)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let body = serde_json::to_vec_pretty(self).context("serializing auth store")?;
+        atomic_write(path, &body, true)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    NotNeeded,
+    Migrated,
+}
+
+/// Securely move credentials out of legacy config formats.
+pub fn migrate_legacy(config_path: &Path, auth_path: &Path) -> Result<MigrationOutcome> {
+    let raw = fs::read_to_string(config_path)
+        .with_context(|| format!("reading legacy config {}", config_path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing legacy config {}", config_path.display()))?;
+    let Some(object) = value.as_object() else {
+        bail!("config root must be a JSON object");
+    };
+    let has_legacy = object.contains_key("oauth")
+        || object.contains_key("tokens")
+        || object.contains_key("accounts")
+        || object
+            .get("upstream")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|u| u.contains_key("static_api_key") || u.contains_key("chat_path"));
+    if !has_legacy {
+        return Ok(MigrationOutcome::NotNeeded);
+    }
+
+    let mut incoming = BTreeMap::new();
+    if let Some(tokens) = object.get("tokens") {
+        let account: AccountAuth =
+            serde_json::from_value(tokens.clone()).context("parsing legacy tokens")?;
+        if account.has_credentials() {
+            incoming.insert("default".to_string(), account);
+        }
+    }
+    if let Some(accounts) = object
+        .get("accounts")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (name, value) in accounts {
+            let account: AccountAuth = serde_json::from_value(value.clone())
+                .with_context(|| format!("parsing legacy account {name}"))?;
+            if account.has_credentials() {
+                incoming.insert(name.clone(), account);
+            }
+        }
+    }
+
+    let mut auth = AuthStore::load(auth_path)?;
+    for (name, account) in incoming {
+        match auth.accounts.get(&name) {
+            Some(existing)
+                if existing.has_credentials() && !same_credentials(existing, &account) =>
+            {
+                bail!(
+                    "auth account {name:?} already contains different credentials; legacy config was preserved"
+                );
+            }
+            Some(existing) if existing.has_credentials() => {}
+            _ => {
+                auth.accounts.insert(name, account);
+            }
+        }
+    }
+
+    auth.save(auth_path)?;
+    let verified = AuthStore::load(auth_path)?;
+    if verified != auth {
+        return Err(anyhow!("auth verification failed after atomic write"));
+    }
+
+    let mut clean: Config = serde_json::from_value(value).context("loading runtime config")?;
+    clean.apply_defaults();
+    clean.save(config_path)?;
+    Ok(MigrationOutcome::Migrated)
+}
+
+fn same_credentials(left: &AccountAuth, right: &AccountAuth) -> bool {
+    left.access_token == right.access_token && left.refresh_token == right.refresh_token
+}
+
+fn atomic_write(path: &Path, body: &[u8], secret: bool) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating directory {}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("state.json");
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if secret { 0o600 } else { 0o644 });
+    }
+    let mut file = options
+        .open(&tmp)
+        .with_context(|| format!("opening temporary file {}", tmp.display()))?;
+    file.write_all(body)
+        .with_context(|| format!("writing temporary file {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing temporary file {}", tmp.display()))?;
+    drop(file);
+    fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    #[cfg(unix)]
+    if secret {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting 0600 permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub fn default_config_path() -> PathBuf {
+    std::env::var_os("MOGICK_PROVIDER_CONFIG")
+        .or_else(|| std::env::var_os("MOGICK_PROXY_CONFIG"))
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("config.json"))
+}
+
+pub fn default_auth_path(config_path: &Path) -> PathBuf {
+    if let Some(path) = std::env::var_os("MOGICK_PROVIDER_AUTH").filter(|p| !p.is_empty()) {
+        return PathBuf::from(path);
+    }
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("auth.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mogick-provider-{name}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn defaults_have_no_credentials() {
+        let config = Config::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("access_token"));
+        assert!(!json.contains("refresh_token"));
+        assert_eq!(config.upstream.api_prefix, "/api/v1");
+        assert_eq!(
+            config.upstream.extra_headers.get("X-App-Id").unwrap(),
+            "mogick"
+        );
+    }
+
+    #[test]
+    fn legacy_migration_is_secure_and_idempotent() {
+        let dir = test_dir("migration");
+        let config_path = dir.join("config.json");
+        let auth_path = dir.join("auth.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "server":{"bind":"127.0.0.1:9999","api_key":""},
+              "oauth":{"client_id":"mogick"},
+              "upstream":{"base_url":"https://copilot.tongyuan.cc","chat_path":"/api/v1/chat/completions"},
+              "tokens":{"access_token":"access-secret","refresh_token":"refresh-secret","expires_at":42}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            migrate_legacy(&config_path, &auth_path).unwrap(),
+            MigrationOutcome::Migrated
+        );
+        let clean = fs::read_to_string(&config_path).unwrap();
+        assert!(!clean.contains("secret"));
+        assert!(!clean.contains("oauth"));
+        let auth = AuthStore::load(&auth_path).unwrap();
+        assert_eq!(auth.accounts["default"].access_token, "access-secret");
+        assert_eq!(
+            migrate_legacy(&config_path, &auth_path).unwrap(),
+            MigrationOutcome::NotNeeded
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_conflict_preserves_legacy_config() {
+        let dir = test_dir("conflict");
+        let config_path = dir.join("config.json");
+        let auth_path = dir.join("auth.json");
+        let legacy = r#"{"oauth":{},"tokens":{"access_token":"old","refresh_token":"old-r"}}"#;
+        fs::write(&config_path, legacy).unwrap();
+        let mut auth = AuthStore::default();
+        auth.accounts.insert(
+            "default".into(),
+            AccountAuth {
+                access_token: "new".into(),
+                refresh_token: "new-r".into(),
+                enabled: true,
+                ..AccountAuth::default()
+            },
+        );
+        auth.save(&auth_path).unwrap();
+        assert!(migrate_legacy(&config_path, &auth_path).is_err());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), legacy);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_write_failure_does_not_remove_tokens() {
+        let dir = test_dir("rollback");
+        let config_path = dir.join("config.json");
+        fs::write(
+            &config_path,
+            r#"{"tokens":{"access_token":"keep-me","refresh_token":"keep-me-too"}}"#,
+        )
+        .unwrap();
+        let impossible_auth = dir.join("parent-is-a-file").join("auth.json");
+        fs::write(dir.join("parent-is-a-file"), "x").unwrap();
+        assert!(migrate_legacy(&config_path, &impossible_auth).is_err());
+        assert!(fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("keep-me"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
