@@ -21,6 +21,8 @@ use crate::anthropic::{self, ProtocolError};
 use crate::config::Config;
 use crate::token::{AccountManager, SelectedAccount};
 
+const MAX_UPSTREAM_JSON_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
@@ -60,6 +62,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
+        .route("/v1/models/:model_id", any(model))
         .route("/v1/models", any(models))
         .route("/v1/*rest", any(openai_passthrough))
         .route("/v1", any(openai_root))
@@ -172,7 +175,8 @@ async fn models(
     if !status.is_success() {
         return anthropic_upstream_error(result.response, &request_id).await;
     }
-    let value: Value = match result.response.json().await {
+    let upstream_headers = result.response.headers().clone();
+    let value: Value = match parse_upstream_json(result.response).await {
         Ok(value) => value,
         Err(_) => {
             return anthropic_error(
@@ -196,11 +200,78 @@ async fn models(
         failover = result.failover_count,
         "request complete"
     );
-    json_response(
+    let mut response = json_response(
         StatusCode::OK,
         anthropic::convert_models(&value),
         &request_id,
-    )
+    );
+    copy_anthropic_rate_headers(response.headers_mut(), &upstream_headers);
+    response
+}
+
+async fn model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: std::result::Result<Bytes, BytesRejection>,
+) -> Response {
+    let is_anthropic = headers.contains_key("anthropic-version");
+    let request_id = request_id(&headers);
+    let body = match body_or_error(body, is_anthropic, &request_id) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    if !is_anthropic {
+        let path = append_query(
+            format!("{}/models/{model_id}", state.config.upstream.api_prefix),
+            uri.query(),
+        );
+        return openai_forward(state, method, path, headers, body).await;
+    }
+
+    // Some OpenAI-compatible providers expose only the list operation. Read
+    // that stable endpoint and resolve the Anthropic model detail locally.
+    let path = format!("{}/models", state.config.upstream.api_prefix);
+    let result = match send_with_failover(&state, Method::GET, &path, &headers, Bytes::new()).await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return anthropic_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                public_error(&error),
+                &request_id,
+            )
+        }
+    };
+    if !result.response.status().is_success() {
+        return anthropic_upstream_error(result.response, &request_id).await;
+    }
+    let upstream_headers = result.response.headers().clone();
+    let value: Value = match parse_upstream_json(result.response).await {
+        Ok(value) => value,
+        Err(_) => {
+            return anthropic_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "upstream returned invalid model data",
+                &request_id,
+            )
+        }
+    };
+    let Some(value) = anthropic::convert_model(&value, &model_id) else {
+        return anthropic_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "model not found",
+            &request_id,
+        );
+    };
+    let mut response = json_response(StatusCode::OK, value, &request_id);
+    copy_anthropic_rate_headers(response.headers_mut(), &upstream_headers);
+    response
 }
 
 async fn openai_forward(
@@ -269,10 +340,219 @@ async fn anthropic_messages(
         Err(response) => return *response,
     };
     let request_bytes = body.len();
-    let converted = match anthropic::convert_request(&body) {
+    let mut converted = match anthropic::convert_request(&body) {
         Ok(converted) => converted,
         Err(error) => return protocol_error(error, &request_id),
     };
+    let path = format!("{}/chat/completions", state.config.upstream.api_prefix);
+    let mut compaction_prelude = None;
+
+    if let Some(config) = converted
+        .compaction
+        .as_ref()
+        .filter(|config| config.should_compact())
+        .cloned()
+    {
+        let summary_body = anthropic::compaction_request_body(&converted.body, &config);
+        let summary_body = match serde_json::to_vec(&summary_body) {
+            Ok(body) => Bytes::from(body),
+            Err(_) => {
+                return anthropic_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "failed to serialize compaction request",
+                    &request_id,
+                )
+            }
+        };
+        let summary_result =
+            match send_with_failover(&state, Method::POST, &path, &headers, summary_body).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return anthropic_error(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        public_error(&error),
+                        &request_id,
+                    )
+                }
+            };
+        if !summary_result.response.status().is_success() {
+            return anthropic_upstream_error(summary_result.response, &request_id).await;
+        }
+        let compaction_headers = summary_result.response.headers().clone();
+        let summary_value: Value = match parse_upstream_json(summary_result.response).await {
+            Ok(value) => value,
+            Err(_) => {
+                return anthropic_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "upstream returned invalid compaction data",
+                    &request_id,
+                )
+            }
+        };
+        let summary = match anthropic::extract_compaction_summary(&summary_value) {
+            Ok(summary) => summary,
+            Err(_) => {
+                return anthropic_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "upstream compaction did not return summary text",
+                    &request_id,
+                )
+            }
+        };
+        let prelude = anthropic::CompactionPrelude {
+            content: summary.clone(),
+            usage: summary_value
+                .get("usage")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        };
+        if config.pause_after_compaction {
+            let message = anthropic::compaction_pause_response(
+                &request_id,
+                &converted.model,
+                &prelude,
+                converted.context_management.as_ref(),
+            );
+            return anthropic_owned_message_response(
+                message,
+                converted.stream,
+                &request_id,
+                &compaction_headers,
+            );
+        }
+        compaction_prelude = Some(prelude);
+        anthropic::apply_compaction_summary(&mut converted.body, &summary);
+    }
+
+    // Strict structured outputs and strict tool calls must be buffered so the
+    // complete JSON can be validated before any bytes become observable to a
+    // streaming client. The client still receives Anthropic SSE afterward.
+    let structured_format = converted.structured_output.clone();
+    let strict_tools = converted.strict_tools.clone();
+    if structured_format.is_some() || !strict_tools.is_empty() {
+        converted.body["stream"] = Value::Bool(false);
+        converted
+            .body
+            .as_object_mut()
+            .map(|body| body.remove("stream_options"));
+        let mut request_body = converted.body.clone();
+        for attempt in 0..=2 {
+            let serialized = match serde_json::to_vec(&request_body) {
+                Ok(body) => Bytes::from(body),
+                Err(_) => {
+                    return anthropic_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "api_error",
+                        "failed to serialize converted request",
+                        &request_id,
+                    )
+                }
+            };
+            let result =
+                match send_with_failover(&state, Method::POST, &path, &headers, serialized).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return anthropic_error(
+                            StatusCode::BAD_GATEWAY,
+                            "api_error",
+                            public_error(&error),
+                            &request_id,
+                        )
+                    }
+                };
+            if !result.response.status().is_success() {
+                return anthropic_upstream_error(result.response, &request_id).await;
+            }
+            let upstream_headers = result.response.headers().clone();
+            let value: Value = match parse_upstream_json(result.response).await {
+                Ok(value) => value,
+                Err(_) => {
+                    return anthropic_error(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        "upstream returned invalid JSON",
+                        &request_id,
+                    )
+                }
+            };
+            let structured_validation = structured_format
+                .as_ref()
+                .map(|format| anthropic::validate_structured_response(&value, format))
+                .unwrap_or(Ok(()));
+            let tool_validation = anthropic::validate_strict_tool_response(&value, &strict_tools);
+            let retry_tool_call = tool_validation.is_err();
+            match structured_validation.and(tool_validation) {
+                Ok(()) => {
+                    let message = match anthropic::convert_response_with_context(
+                        &value,
+                        &request_id,
+                        &converted.model,
+                        converted.thinking_display,
+                        compaction_prelude.as_ref(),
+                        converted.context_management.as_ref(),
+                    ) {
+                        Ok(message) => message,
+                        Err(_) => {
+                            return anthropic_error(
+                                StatusCode::BAD_GATEWAY,
+                                "api_error",
+                                "upstream returned an incompatible response",
+                                &request_id,
+                            )
+                        }
+                    };
+                    return anthropic_owned_message_response(
+                        message,
+                        converted.stream,
+                        &request_id,
+                        &upstream_headers,
+                    );
+                }
+                Err(error) if attempt < 2 => {
+                    tracing::warn!(
+                        request_id,
+                        attempt = attempt + 1,
+                        error,
+                        "retrying invalid constrained output"
+                    );
+                    request_body = if retry_tool_call {
+                        anthropic::strict_tool_retry_body(&request_body, &value)
+                    } else {
+                        anthropic::structured_retry_body(&request_body, &value)
+                    };
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        request_id,
+                        attempts = 3,
+                        error,
+                        "constrained output validation exhausted"
+                    );
+                    return anthropic_error(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        if retry_tool_call {
+                            "upstream could not produce valid strict tool arguments after bounded retries"
+                        } else {
+                            "upstream could not produce output matching the requested JSON Schema after bounded retries"
+                        },
+                        &request_id,
+                    );
+                }
+            }
+        }
+        return anthropic_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "constrained output retry loop ended unexpectedly",
+            &request_id,
+        );
+    }
+
     let upstream_body = match serde_json::to_vec(&converted.body) {
         Ok(body) => Bytes::from(body),
         Err(_) => {
@@ -281,10 +561,9 @@ async fn anthropic_messages(
                 "api_error",
                 "failed to serialize converted request",
                 &request_id,
-            );
+            )
         }
     };
-    let path = format!("{}/chat/completions", state.config.upstream.api_prefix);
     let result =
         match send_with_failover(&state, Method::POST, &path, &headers, upstream_body).await {
             Ok(result) => result,
@@ -294,7 +573,7 @@ async fn anthropic_messages(
                     "api_error",
                     public_error(&error),
                     &request_id,
-                );
+                )
             }
         };
     let status = result.response.status();
@@ -317,6 +596,7 @@ async fn anthropic_messages(
     if !status.is_success() {
         return anthropic_upstream_error(result.response, &request_id).await;
     }
+    let upstream_headers = result.response.headers().clone();
     if converted.stream {
         let mut response = Response::builder()
             .status(StatusCode::OK)
@@ -324,16 +604,20 @@ async fn anthropic_messages(
             .header(header::CACHE_CONTROL, "no-cache")
             .header("x-request-id", &request_id)
             .header("x-accel-buffering", "no")
-            .body(anthropic::stream_body(
+            .body(anthropic::stream_body_with_context(
                 result.response,
                 request_id.clone(),
                 converted.model,
+                converted.thinking_display,
+                compaction_prelude,
+                converted.context_management,
             ))
             .unwrap_or_else(|_| Response::new(Body::empty()));
         insert_request_id(response.headers_mut(), &request_id);
+        copy_anthropic_rate_headers(response.headers_mut(), &upstream_headers);
         return response;
     }
-    let value: Value = match result.response.json().await {
+    let value: Value = match parse_upstream_json(result.response).await {
         Ok(value) => value,
         Err(_) => {
             return anthropic_error(
@@ -344,8 +628,19 @@ async fn anthropic_messages(
             );
         }
     };
-    match anthropic::convert_response(&value, &request_id, &converted.model) {
-        Ok(value) => json_response(StatusCode::OK, value, &request_id),
+    match anthropic::convert_response_with_context(
+        &value,
+        &request_id,
+        &converted.model,
+        converted.thinking_display,
+        compaction_prelude.as_ref(),
+        converted.context_management.as_ref(),
+    ) {
+        Ok(value) => {
+            let mut response = json_response(StatusCode::OK, value, &request_id);
+            copy_anthropic_rate_headers(response.headers_mut(), &upstream_headers);
+            response
+        }
         Err(_) => anthropic_error(
             StatusCode::BAD_GATEWAY,
             "api_error",
@@ -353,6 +648,28 @@ async fn anthropic_messages(
             &request_id,
         ),
     }
+}
+
+fn anthropic_owned_message_response(
+    message: Value,
+    stream: bool,
+    request_id: &str,
+    upstream_headers: &HeaderMap,
+) -> Response {
+    let mut response = if stream {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(anthropic::synthetic_stream_body(message))
+            .unwrap_or_else(|_| Response::new(Body::empty()))
+    } else {
+        json_response(StatusCode::OK, message, request_id)
+    };
+    insert_request_id(response.headers_mut(), request_id);
+    copy_anthropic_rate_headers(response.headers_mut(), upstream_headers);
+    response
 }
 
 async fn anthropic_count_tokens(
@@ -366,7 +683,7 @@ async fn anthropic_count_tokens(
         Ok(body) => body,
         Err(response) => return *response,
     };
-    let mut converted = match anthropic::convert_request(&body) {
+    let mut converted = match anthropic::convert_count_request(&body) {
         Ok(converted) => converted,
         Err(error) => return protocol_error(error, &request_id),
     };
@@ -403,7 +720,8 @@ async fn anthropic_count_tokens(
     if !result.response.status().is_success() {
         return anthropic_upstream_error(result.response, &request_id).await;
     }
-    let value: Value = match result.response.json().await {
+    let upstream_headers = result.response.headers().clone();
+    let value: Value = match parse_upstream_json(result.response).await {
         Ok(value) => value,
         Err(_) => {
             return anthropic_error(
@@ -435,11 +753,16 @@ async fn anthropic_count_tokens(
                 failover = result.failover_count,
                 "request complete"
             );
-            json_response(
-                StatusCode::OK,
-                json!({"input_tokens":input_tokens}),
-                &request_id,
-            )
+            let mut value = json!({"input_tokens":input_tokens});
+            if let Some(context_management) = &converted.context_management {
+                value["context_management"] = json!({
+                    "original_input_tokens":context_management
+                        .original_input_tokens_for(input_tokens)
+                });
+            }
+            let mut response = json_response(StatusCode::OK, value, &request_id);
+            copy_anthropic_rate_headers(response.headers_mut(), &upstream_headers);
+            response
         }
         None => anthropic_error(
             StatusCode::BAD_GATEWAY,
@@ -680,6 +1003,7 @@ async fn upstream_openai_response(response: reqwest::Response, request_id: &str)
 async fn anthropic_upstream_error(response: reqwest::Response, request_id: &str) -> Response {
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let upstream_headers = response.headers().clone();
     let value = sanitized_upstream_error(response).await;
     let message = value
         .get("error")
@@ -695,12 +1019,30 @@ async fn anthropic_upstream_error(response: reqwest::Response, request_id: &str)
         429 => "rate_limit_error",
         _ => "api_error",
     };
-    anthropic_error(status, error_type, message, request_id)
+    let mut response = anthropic_error(status, error_type, message, request_id);
+    copy_anthropic_rate_headers(response.headers_mut(), &upstream_headers);
+    response
+}
+
+async fn parse_upstream_json(response: reqwest::Response) -> std::result::Result<Value, ()> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_UPSTREAM_JSON_BYTES as u64)
+    {
+        return Err(());
+    }
+    let bytes = response.bytes().await.map_err(|_| ())?;
+    if bytes.len() > MAX_UPSTREAM_JSON_BYTES {
+        return Err(());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ())
 }
 
 async fn sanitized_upstream_error(response: reqwest::Response) -> Value {
-    let text = response.text().await.unwrap_or_default();
-    let mut value = serde_json::from_str::<Value>(&text).unwrap_or_else(
+    let bytes = response.bytes().await.unwrap_or_default();
+    let bytes = &bytes[..bytes.len().min(64 * 1024)];
+    let text = String::from_utf8_lossy(bytes);
+    let mut value = serde_json::from_slice::<Value>(bytes).unwrap_or_else(
         |_| json!({"error":{"type":"upstream_error", "message":sanitize_text(&text)}}),
     );
     redact_value(&mut value);
@@ -977,7 +1319,18 @@ fn json_response(status: StatusCode, value: Value, request_id: &str) -> Response
 }
 
 fn public_error(error: &anyhow::Error) -> &'static str {
-    let message = error.to_string().to_ascii_lowercase();
+    if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+    {
+        return safe_reqwest_error(error);
+    }
+    let message = error
+        .chain()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+        .to_ascii_lowercase();
     if message.contains("no enabled") {
         "no authenticated account is available"
     } else if message.contains("timeout") {
@@ -1029,8 +1382,6 @@ fn is_forwardable_request_header(name: &str) -> bool {
             | "x-request-id"
             | "x-client-type"
             | "x-session-id"
-            | "anthropic-version"
-            | "anthropic-beta"
     )
 }
 
@@ -1047,6 +1398,75 @@ fn is_forwardable_response_header(name: &str) -> bool {
             | "x-accel-buffering"
     ) || lower.starts_with("x-ratelimit-")
         || lower.starts_with("anthropic-ratelimit-")
+}
+
+fn copy_anthropic_rate_headers(target: &mut HeaderMap, source: &HeaderMap) {
+    const MAPPINGS: &[(&str, &str)] = &[
+        ("retry-after", "retry-after"),
+        (
+            "x-ratelimit-limit-requests",
+            "anthropic-ratelimit-requests-limit",
+        ),
+        (
+            "x-ratelimit-remaining-requests",
+            "anthropic-ratelimit-requests-remaining",
+        ),
+        (
+            "x-ratelimit-reset-requests",
+            "anthropic-ratelimit-requests-reset",
+        ),
+        (
+            "x-ratelimit-limit-tokens",
+            "anthropic-ratelimit-tokens-limit",
+        ),
+        (
+            "x-ratelimit-remaining-tokens",
+            "anthropic-ratelimit-tokens-remaining",
+        ),
+        (
+            "x-ratelimit-reset-tokens",
+            "anthropic-ratelimit-tokens-reset",
+        ),
+        (
+            "x-ratelimit-limit-input-tokens",
+            "anthropic-ratelimit-input-tokens-limit",
+        ),
+        (
+            "x-ratelimit-remaining-input-tokens",
+            "anthropic-ratelimit-input-tokens-remaining",
+        ),
+        (
+            "x-ratelimit-reset-input-tokens",
+            "anthropic-ratelimit-input-tokens-reset",
+        ),
+        (
+            "x-ratelimit-limit-output-tokens",
+            "anthropic-ratelimit-output-tokens-limit",
+        ),
+        (
+            "x-ratelimit-remaining-output-tokens",
+            "anthropic-ratelimit-output-tokens-remaining",
+        ),
+        (
+            "x-ratelimit-reset-output-tokens",
+            "anthropic-ratelimit-output-tokens-reset",
+        ),
+    ];
+    for (upstream, anthropic) in MAPPINGS {
+        if let Some(value) = source.get(*upstream) {
+            if let (Ok(name), Ok(value)) = (
+                axum::http::HeaderName::from_bytes(anthropic.as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                target.insert(name, value);
+            }
+        }
+    }
+    for (name, value) in source {
+        if name.as_str().starts_with("anthropic-ratelimit-") {
+            target.insert(name.clone(), value.clone());
+        }
+    }
 }
 
 fn is_reserved_upstream_header(name: &str) -> bool {
@@ -1098,6 +1518,8 @@ mod tests {
         rate_limit_first: bool,
         unauthorized_first: bool,
         server_error_first: bool,
+        stall_compaction: bool,
+        fail_repair: bool,
     }
 
     #[derive(Clone)]
@@ -1167,6 +1589,70 @@ mod tests {
         if uri.path().ends_with("/embeddings") {
             return Json(json!({"object":"list","model":value["model"],"data":[]})).into_response();
         }
+        let request_text = value.to_string();
+        if state.fail_repair && request_text.contains("failed strict JSON Schema validation") {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":{"message":"repair failed"}})),
+            )
+                .into_response();
+        }
+        if request_text.contains("Create the compaction summary now") {
+            if state.stall_compaction {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            if request_text.contains("EMPTY_COMPACTION_FIXTURE") {
+                return Json(json!({
+                    "id":"compact-empty",
+                    "model":value["model"],
+                    "choices":[{"message":{"content":"   "},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":50001,"completion_tokens":1}
+                }))
+                .into_response();
+            }
+            return Json(json!({
+                "id":"compact-1",
+                "model":value["model"],
+                "choices":[{"message":{"content":"<summary>preserved project state</summary>"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":50001,"completion_tokens":20}
+            }))
+            .into_response();
+        }
+        if request_text.contains("STRICT_TOOL_RETRY") {
+            let repaired = request_text.contains("failed strict JSON Schema validation");
+            let arguments = if repaired {
+                r#"{"path":"src/main.rs"}"#
+            } else {
+                r#"{"wrong":1}"#
+            };
+            return Json(json!({
+                "id":"strict-tool-1",
+                "model":value["model"],
+                "choices":[{"message":{"content":null,"tool_calls":[{
+                    "id":"call_strict",
+                    "type":"function",
+                    "function":{"name":"Read","arguments":arguments}
+                }]},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":42,"completion_tokens":8}
+            }))
+            .into_response();
+        }
+        if value.get("response_format").is_some() {
+            let retry_fixture = request_text.contains("STRUCTURED_RETRY");
+            let repaired = request_text.contains("failed strict JSON Schema validation");
+            let content = if retry_fixture && !repaired {
+                r#"{"wrong":1}"#
+            } else {
+                r#"{"title":"hello"}"#
+            };
+            return Json(json!({
+                "id":"structured-1",
+                "model":value["model"],
+                "choices":[{"message":{"content":content},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":42,"completion_tokens":8}
+            }))
+            .into_response();
+        }
         if value.get("stream").and_then(Value::as_bool) == Some(true) {
             let chunks: Vec<std::result::Result<Bytes, Infallible>> = vec![
                 Ok(Bytes::from_static(
@@ -1201,6 +1687,14 @@ mod tests {
             server_error_first,
             ..MockUpstream::default()
         };
+        test_gateway_with_mock(mock, max_request_bytes, 600).await
+    }
+
+    async fn test_gateway_with_mock(
+        mock: MockUpstream,
+        max_request_bytes: usize,
+        timeout_secs: u64,
+    ) -> (Router, MockUpstream, PathBuf, tokio::task::JoinHandle<()>) {
         let upstream = Router::new()
             .route("/api/v1/*rest", any(mock_upstream_handler))
             .with_state(mock.clone());
@@ -1228,6 +1722,7 @@ mod tests {
         let mut config = Config::default();
         config.server.api_key = "gateway-secret".into();
         config.upstream.base_url = format!("http://{address}");
+        config.upstream.timeout_secs = timeout_secs;
         config.runtime.max_request_bytes = max_request_bytes;
         config
             .upstream
@@ -1298,6 +1793,27 @@ mod tests {
             upstream_path(&config, "files/a/content", None),
             "/api/v1/files/a/content"
         );
+        assert!(!is_forwardable_request_header("anthropic-version"));
+        assert!(!is_forwardable_request_header("anthropic-beta"));
+    }
+
+    #[test]
+    fn openai_rate_limit_headers_are_exposed_with_anthropic_names() {
+        let mut upstream = HeaderMap::new();
+        upstream.insert(
+            "x-ratelimit-limit-requests",
+            HeaderValue::from_static("100"),
+        );
+        upstream.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("42000"),
+        );
+        upstream.insert("retry-after", HeaderValue::from_static("3"));
+        let mut output = HeaderMap::new();
+        copy_anthropic_rate_headers(&mut output, &upstream);
+        assert_eq!(output["anthropic-ratelimit-requests-limit"], "100");
+        assert_eq!(output["anthropic-ratelimit-tokens-remaining"], "42000");
+        assert_eq!(output["retry-after"], "3");
     }
 
     #[test]
@@ -1531,7 +2047,22 @@ mod tests {
                     .oneshot(gateway_request(
                         Method::POST,
                         "/v1/messages/count_tokens",
-                        Body::from(message_body),
+                        Body::from(
+                            json!({
+                                "model":"mm-future-model",
+                                "messages":[
+                                    {"role":"user","content":"obsolete".repeat(1000)},
+                                    {"role":"assistant","content":[{
+                                        "type":"compaction","content":"short summary"
+                                    }]},
+                                    {"role":"user","content":"hi"}
+                                ],
+                                "context_management":{"edits":[{
+                                    "type":"compact_20260112"
+                                }]}
+                            })
+                            .to_string(),
+                        ),
                     ))
                     .await
                     .unwrap()
@@ -1543,6 +2074,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count["input_tokens"], 42);
+        assert!(
+            count["context_management"]["original_input_tokens"]
+                .as_u64()
+                .unwrap()
+                > 42
+        );
 
         let mut model_request = gateway_request(Method::GET, "/v1/models", Body::empty());
         model_request
@@ -1562,6 +2099,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(models["data"][0]["id"], "mm-future-model");
+        assert_eq!(
+            models["data"][0]["capabilities"]["context_management"]["compact_20260112"]
+                ["supported"],
+            true
+        );
+
+        let mut model_request =
+            gateway_request(Method::GET, "/v1/models/mm-future-model", Body::empty());
+        model_request
+            .headers_mut()
+            .insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let model: Value = serde_json::from_slice(
+            &to_bytes(
+                app.clone()
+                    .oneshot(model_request)
+                    .await
+                    .unwrap()
+                    .into_body(),
+                usize::MAX,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(model["id"], "mm-future-model");
+        assert_eq!(
+            model["capabilities"]["structured_outputs"]["supported"],
+            true
+        );
 
         let stream_body = r#"{"model":"mm-future-model","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
         let stream = app
@@ -1591,6 +2157,337 @@ mod tests {
                 && request.body["stream"] == false
         }));
         drop(seen);
+        task.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_runs_summary_then_continues_and_structured_stream_is_validated() {
+        let (app, mock, auth_path, task) = test_gateway(false, false, 1024 * 1024).await;
+        let large_history = format!("BEGIN_OLD_HISTORY{}END_OLD_HISTORY", "x".repeat(200_100));
+        let compact_request = json!({
+            "model":"mm-future-model",
+            "max_tokens":100,
+            "messages":[{"role":"user","content":large_history}],
+            "context_management":{"edits":[{
+                "type":"compact_20260112",
+                "trigger":{"type":"input_tokens","value":50000}
+            }]}
+        });
+        let response = app
+            .clone()
+            .oneshot(gateway_request(
+                Method::POST,
+                "/v1/messages",
+                Body::from(compact_request.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(response["content"][0]["type"], "compaction");
+        assert!(response["content"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("preserved project state"));
+        assert_eq!(response["content"][1]["text"], "hello");
+        assert_eq!(response["usage"]["iterations"][0]["type"], "compaction");
+        assert_eq!(response["usage"]["iterations"][1]["type"], "message");
+
+        let structured_request = json!({
+            "model":"mm-future-model",
+            "max_tokens":100,
+            "stream":true,
+            "messages":[{"role":"user","content":"make a title"}],
+            "output_config":{"format":{"type":"json_schema","schema":{
+                "type":"object",
+                "properties":{"title":{"type":"string"}},
+                "required":["title"],
+                "additionalProperties":false
+            }}}
+        });
+        let structured = app
+            .clone()
+            .oneshot(gateway_request(
+                Method::POST,
+                "/v1/messages",
+                Body::from(structured_request.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(structured.status(), StatusCode::OK);
+        assert_eq!(
+            structured.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let structured = String::from_utf8(
+            to_bytes(structured.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(structured.contains("{\\\"title\\\":\\\"hello\\\"}"));
+        assert!(structured.contains("event: message_stop"));
+
+        let seen = mock.seen.lock().await;
+        assert_eq!(seen.len(), 3);
+        assert!(seen[0].body.to_string().contains("BEGIN_OLD_HISTORY"));
+        assert!(!seen[1].body.to_string().contains("BEGIN_OLD_HISTORY"));
+        assert!(seen[1].body.to_string().contains("preserved project state"));
+        assert_eq!(seen[2].body["stream"], false);
+        drop(seen);
+        task.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn constrained_outputs_retry_before_becoming_visible_to_claude_code() {
+        let (app, mock, auth_path, task) = test_gateway(false, false, 1024 * 1024).await;
+        let structured_request = json!({
+            "model":"mm-future-model",
+            "max_tokens":100,
+            "stream":true,
+            "messages":[{"role":"user","content":"STRUCTURED_RETRY"}],
+            "output_config":{"format":{"type":"json_schema","schema":{
+                "type":"object",
+                "properties":{"title":{"type":"string"}},
+                "required":["title"],
+                "additionalProperties":false
+            }}}
+        });
+        let response = app
+            .clone()
+            .oneshot(gateway_request(
+                Method::POST,
+                "/v1/messages",
+                Body::from(structured_request.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stream = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(stream.contains("{\\\"title\\\":\\\"hello\\\"}"));
+        assert!(!stream.contains("wrong"));
+
+        let strict_tool_request = json!({
+            "model":"mm-future-model",
+            "max_tokens":100,
+            "stream":true,
+            "messages":[{"role":"user","content":"STRICT_TOOL_RETRY"}],
+            "tools":[{
+                "name":"Read",
+                "strict":true,
+                "input_schema":{
+                    "type":"object",
+                    "properties":{"path":{"type":"string"}},
+                    "required":["path"],
+                    "additionalProperties":false
+                }
+            }]
+        });
+        let response = app
+            .clone()
+            .oneshot(gateway_request(
+                Method::POST,
+                "/v1/messages",
+                Body::from(strict_tool_request.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stream = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(stream.contains("src/main.rs"));
+        assert!(!stream.contains("\\\"wrong\\\""));
+
+        let seen = mock.seen.lock().await;
+        assert_eq!(seen.len(), 4);
+        assert!(seen[1]
+            .body
+            .to_string()
+            .contains("failed strict JSON Schema validation"));
+        assert!(seen[3]
+            .body
+            .to_string()
+            .contains("invalid tool-call attempt"));
+        assert!(seen[3].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("tool_calls").is_none()));
+        drop(seen);
+        task.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_compaction_streams_with_stable_block_indexes() {
+        let (app, mock, auth_path, task) = test_gateway(false, false, 1024 * 1024).await;
+        let request = json!({
+            "model":"mm-future-model",
+            "max_tokens":100,
+            "stream":true,
+            "messages":[
+                {"role":"user","content":"OBSOLETE_BEFORE_FIRST_COMPACTION"},
+                {"role":"assistant","content":[{
+                    "type":"compaction","content":"first authoritative summary"
+                }]},
+                {"role":"user","content":format!(
+                    "SECOND_EPOCH_BEGIN{}SECOND_EPOCH_END",
+                    "x".repeat(210_000)
+                )}
+            ],
+            "context_management":{"edits":[{
+                "type":"compact_20260112",
+                "trigger":{"type":"input_tokens","value":50000}
+            }]}
+        });
+        let response = app
+            .oneshot(gateway_request(
+                Method::POST,
+                "/v1/messages",
+                Body::from(request.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stream = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(stream
+            .contains("\"content_block\":{\"content\":\"\",\"type\":\"compaction\"},\"index\":0"));
+        assert!(stream.contains("\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":1"));
+        assert!(stream.contains("\"type\":\"compaction_delta\""));
+        assert!(stream.contains("\"iterations\":["));
+        assert!(stream.contains("\"type\":\"compaction\""));
+        assert!(stream.contains("\"type\":\"message\""));
+        assert!(stream.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+
+        let seen = mock.seen.lock().await;
+        assert_eq!(seen.len(), 2);
+        let summary_request = seen[0].body.to_string();
+        assert!(summary_request.contains("first authoritative summary"));
+        assert!(summary_request.contains("SECOND_EPOCH_BEGIN"));
+        assert!(!summary_request.contains("OBSOLETE_BEFORE_FIRST_COMPACTION"));
+        let continued_request = seen[1].body.to_string();
+        assert_eq!(seen[1].body["stream"], true);
+        assert!(continued_request.contains("preserved project state"));
+        assert!(!continued_request.contains("SECOND_EPOCH_BEGIN"));
+        drop(seen);
+        task.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn orchestration_failures_stop_safely() {
+        let timeout_mock = MockUpstream {
+            stall_compaction: true,
+            ..MockUpstream::default()
+        };
+        let (app, mock, auth_path, task) =
+            test_gateway_with_mock(timeout_mock, 1024 * 1024, 1).await;
+        let compaction_request = |marker: &str| {
+            json!({
+                "model":"mm-future-model",
+                "max_tokens":100,
+                "messages":[{"role":"user","content":format!(
+                    "{marker}{}", "x".repeat(210_000)
+                )}],
+                "context_management":{"edits":[{
+                    "type":"compact_20260112",
+                    "trigger":{"type":"input_tokens","value":50000}
+                }]}
+            })
+        };
+        let response = app
+            .oneshot(gateway_request(
+                Method::POST,
+                "/v1/messages",
+                Body::from(compaction_request("TIMEOUT_COMPACTION_FIXTURE").to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("upstream request timed out"));
+        assert_eq!(mock.seen.lock().await.len(), 1);
+        task.abort();
+        std::fs::remove_file(auth_path).unwrap();
+
+        let (app, _, auth_path, task) = test_gateway(false, false, 1024 * 1024).await;
+        let response = app
+            .oneshot(gateway_request(
+                Method::POST,
+                "/v1/messages",
+                Body::from(compaction_request("EMPTY_COMPACTION_FIXTURE").to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("did not return summary text"));
+        task.abort();
+        std::fs::remove_file(auth_path).unwrap();
+
+        let repair_mock = MockUpstream {
+            fail_repair: true,
+            ..MockUpstream::default()
+        };
+        let (app, mock, auth_path, task) =
+            test_gateway_with_mock(repair_mock, 1024 * 1024, 600).await;
+        let response = app
+            .oneshot(gateway_request(
+                Method::POST,
+                "/v1/messages",
+                Body::from(
+                    json!({
+                        "model":"mm-future-model",
+                        "max_tokens":100,
+                        "messages":[{"role":"user","content":"STRUCTURED_RETRY"}],
+                        "output_config":{"format":{"type":"json_schema","schema":{
+                            "type":"object",
+                            "properties":{"title":{"type":"string"}},
+                            "required":["title"],
+                            "additionalProperties":false
+                        }}}
+                    })
+                    .to_string(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mock.seen.lock().await.len(), 2);
         task.abort();
         std::fs::remove_file(auth_path).unwrap();
     }

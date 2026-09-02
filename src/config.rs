@@ -17,6 +17,7 @@ pub mod defaults {
     pub const UPSTREAM_BASE_URL: &str = "https://copilot.tongyuan.cc";
     pub const UPSTREAM_API_PREFIX: &str = "/api/v1";
     pub const UPSTREAM_X_APP_ID: &str = "mogick";
+    pub const UPSTREAM_TIMEOUT_SECS: u64 = 600;
     pub const SERVER_BIND: &str = "127.0.0.1:8787";
     pub const BALANCE_POLL_SECS: u64 = 180;
     pub const REFRESH_SKEW_SECS: i64 = 60;
@@ -81,7 +82,7 @@ impl Default for UpstreamConfig {
         Self {
             base_url: defaults::UPSTREAM_BASE_URL.into(),
             api_prefix: defaults::UPSTREAM_API_PREFIX.into(),
-            timeout_secs: 120,
+            timeout_secs: defaults::UPSTREAM_TIMEOUT_SECS,
             extra_headers,
         }
     }
@@ -99,7 +100,7 @@ impl UpstreamConfig {
         }
         self.api_prefix = format!("/{}", self.api_prefix.trim_matches('/'));
         if self.timeout_secs == 0 {
-            self.timeout_secs = 120;
+            self.timeout_secs = defaults::UPSTREAM_TIMEOUT_SECS;
         }
         if !self
             .extra_headers

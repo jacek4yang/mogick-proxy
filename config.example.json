@@ -6,7 +6,7 @@
   "upstream": {
     "base_url": "https://copilot.tongyuan.cc",
     "api_prefix": "/api/v1",
-    "timeout_secs": 120,
+    "timeout_secs": 600,
     "extra_headers": {
       "X-App-Id": "mogick"
     }
