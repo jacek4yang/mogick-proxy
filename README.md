@@ -104,7 +104,7 @@ claude
 
 Claude Code 不认识 `deepseek-v4-flash` 这类网关模型 ID 时会采用保守的 context window。DeepSeek 发布的 V4 Flash 上下文是 1,000,000 tokens，因此示例为该模型设置 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`；切换模型或上游部署存在更小限制时必须同步改成真实值。对普通未知 ID，这个变量会保留 Claude Code 的主动 compaction 并修正窗口。不要仅为消除警告给模型名追加 `[1m]`：网关不会剥离后缀，上游必须真的接受该 ID 才能使用。`CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` 仅适合无法取得真实窗口时作为后备，它会推迟到 API 报 context-limit 错误才触发恢复，不是推荐默认值。
 
-长时间编程 turn 建议同时保持 `upstream.timeout_secs` 与 Claude Code 的 `API_TIMEOUT_MS` 一致；新配置默认分别为 600 秒和 600000 毫秒。已有 `config.json` 不会被静默改写，需要手动把旧的 120 秒值调大。
+长时间编程 turn 建议同时保持 `upstream.timeout_secs` 与 Claude Code 的 `API_TIMEOUT_MS` 为合理的大值；新配置默认分别为 600 秒和 600000 毫秒。`upstream.timeout_secs` 是上游连续无读取活动的超时，而不是整条 SSE 的总寿命，因此持续输出的长任务可以运行超过 600 秒。网关在 Anthropic 流连续 10 秒没有产生客户端可见事件时发送标准 `ping` 事件，防止 Claude Code 把仍在推理的连接误判为 idle。已有 `config.json` 不会被静默改写，需要手动把旧的 120 秒值调大。
 
 不需要设置 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`、`CLAUDE_CODE_DISABLE_THINKING` 或 `MAX_THINKING_TOKENS=0`。当前 Claude Code 的 beta header、adaptive thinking、effort、context management、prompt caching、mid-conversation system、严格/延迟工具 schema、普通与流式工具循环都由网关兼容处理。Anthropic 专属 header 不会继续泄漏给 OpenAI 上游。
 

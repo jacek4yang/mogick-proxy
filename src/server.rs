@@ -37,7 +37,11 @@ impl AppState {
             // traffic is unaffected by this outbound proxy policy.
             .no_proxy()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(config.upstream.timeout_secs))
+            // Apply the configured limit to each period without upstream
+            // activity, rather than to the total lifetime of a streaming
+            // response. A healthy long-running Claude Code turn may exceed
+            // this duration while continuing to deliver chunks.
+            .read_timeout(Duration::from_secs(config.upstream.timeout_secs))
             .build()
             .context("building upstream HTTP client")?;
         Ok(Self {
@@ -1519,6 +1523,7 @@ mod tests {
         unauthorized_first: bool,
         server_error_first: bool,
         stall_compaction: bool,
+        stall_stream: bool,
         fail_repair: bool,
     }
 
@@ -1654,18 +1659,22 @@ mod tests {
             .into_response();
         }
         if value.get("stream").and_then(Value::as_bool) == Some(true) {
-            let chunks: Vec<std::result::Result<Bytes, Infallible>> = vec![
-                Ok(Bytes::from_static(
+            let stall_stream = state.stall_stream;
+            let chunks = async_stream::stream! {
+                yield Ok::<Bytes, Infallible>(Bytes::from_static(
                     b"data: {\"id\":\"chat-s\",\"model\":\"mm-future-model\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
-                )),
-                Ok(Bytes::from_static(
+                ));
+                if stall_stream {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                yield Ok::<Bytes, Infallible>(Bytes::from_static(
                     b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n",
-                )),
-            ];
+                ));
+            };
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/event-stream")
-                .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                .body(Body::from_stream(chunks))
                 .unwrap();
         }
         Json(json!({
@@ -2157,6 +2166,45 @@ mod tests {
                 && request.body["stream"] == false
         }));
         drop(seen);
+        task.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_sends_pings_while_upstream_is_idle() {
+        let mock = MockUpstream {
+            stall_stream: true,
+            ..MockUpstream::default()
+        };
+        let (app, _, auth_path, task) = test_gateway_with_mock(mock, 1024 * 1024, 600).await;
+        let stream = app
+            .oneshot(gateway_request(
+                Method::POST,
+                "/v1/messages",
+                Body::from(
+                    r#"{"model":"mm-future-model","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+
+        let stream_text = String::from_utf8(
+            to_bytes(stream.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let first_delta = stream_text.find("event: content_block_delta").unwrap();
+        let ping = stream_text
+            .find("event: ping\ndata: {\"type\":\"ping\"}")
+            .unwrap();
+        let message_stop = stream_text.find("event: message_stop").unwrap();
+        assert!(first_delta < ping);
+        assert!(ping < message_stop);
+        assert!(stream_text.matches("event: ping").count() >= 2);
+
         task.abort();
         std::fs::remove_file(auth_path).unwrap();
     }

@@ -1,6 +1,7 @@
 //! Anthropic Messages v1 to OpenAI Chat Completions protocol conversion.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use axum::body::Body;
 use bytes::Bytes;
@@ -105,6 +106,10 @@ pub enum ThinkingDisplay {
 const SAFE_THINKING_SUMMARY: &str =
     "The upstream model performed internal reasoning; private details are omitted by the gateway.";
 const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(not(test))]
+const STREAM_PING_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STREAM_PING_INTERVAL: Duration = Duration::from_millis(25);
 const STRUCTURED_OUTPUT_INSTRUCTION_PREFIX: &str =
     "Return exactly one JSON object for output format ";
 
@@ -2390,6 +2395,8 @@ pub fn stream_body_with_context(
 ) -> Body {
     let output = async_stream::stream! {
         let mut upstream = response.bytes_stream();
+        let idle = tokio::time::sleep(STREAM_PING_INTERVAL);
+        tokio::pin!(idle);
         let mut decoder = SseDecoder::default();
         let mut state = StreamState::new(
             request_id,
@@ -2398,36 +2405,56 @@ pub fn stream_body_with_context(
             compaction,
             context_management,
         );
-        while let Some(chunk) = upstream.next().await {
-            match chunk {
-                Ok(chunk) => {
-                    let events = match decoder.push(&chunk) {
-                        Ok(events) => events,
-                        Err(()) => {
-                            yield Ok(sse_frame("error", error_envelope(
-                                "api_error",
-                                "upstream SSE event exceeded the gateway limit",
-                                &state.request_id,
-                            )));
-                            return;
-                        }
-                    };
-                    for event in events {
-                        for frame in state.handle(&event.data) {
-                            yield Ok::<Bytes, std::io::Error>(frame);
-                        }
-                        if state.terminal {
-                            return;
+        loop {
+            tokio::select! {
+                biased;
+                chunk = upstream.next() => match chunk {
+                    Some(Ok(chunk)) => {
+                        let events = match decoder.push(&chunk) {
+                            Ok(events) => events,
+                            Err(()) => {
+                                yield Ok(sse_frame("error", error_envelope(
+                                    "api_error",
+                                    "upstream SSE event exceeded the gateway limit",
+                                    &state.request_id,
+                                )));
+                                return;
+                            }
+                        };
+                        for event in events {
+                            for frame in state.handle(&event.data) {
+                                idle.as_mut().reset(
+                                    tokio::time::Instant::now() + STREAM_PING_INTERVAL,
+                                );
+                                yield Ok::<Bytes, std::io::Error>(frame);
+                            }
+                            if state.terminal {
+                                return;
+                            }
                         }
                     }
-                }
-                Err(_) => {
-                    yield Ok(sse_frame("error", error_envelope(
-                        "api_error",
-                        "upstream stream was interrupted",
-                        &state.request_id,
-                    )));
-                    return;
+                    Some(Err(error)) => {
+                        tracing::warn!(
+                            request_id = %state.request_id,
+                            timeout = error.is_timeout(),
+                            "upstream Anthropic stream interrupted"
+                        );
+                        yield Ok(sse_frame("error", error_envelope(
+                            "api_error",
+                            "upstream stream was interrupted",
+                            &state.request_id,
+                        )));
+                        return;
+                    }
+                    None => break,
+                },
+                _ = &mut idle => {
+                    // Anthropic permits ping events throughout an SSE
+                    // response. Emit one only when no client-visible frame
+                    // has been produced recently, so Claude Code does not
+                    // mistake a slow reasoning interval for a dead stream.
+                    yield Ok(sse_frame("ping", json!({"type":"ping"})));
+                    idle.as_mut().reset(tokio::time::Instant::now() + STREAM_PING_INTERVAL);
                 }
             }
         }
