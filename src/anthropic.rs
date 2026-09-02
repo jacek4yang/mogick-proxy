@@ -2500,6 +2500,10 @@ pub fn error_envelope(error_type: &str, message: impl Into<String>, request_id: 
     })
 }
 
+// This transport boundary carries independently-owned stream state from the
+// server layer. Keeping the parameters explicit makes retry/stream lifetimes
+// visible; bundling them solely to satisfy this lint would hide that contract.
+#[allow(clippy::too_many_arguments)]
 pub fn stream_body_with_context(
     response: reqwest::Response,
     request_id: String,

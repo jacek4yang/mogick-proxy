@@ -18,7 +18,8 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::anthropic::{self, ProtocolError};
-use crate::config::Config;
+use crate::config::{defaults, Config};
+use crate::fingerprint::MogickFingerprint;
 use crate::token::{AccountManager, SelectedAccount};
 
 const MAX_UPSTREAM_JSON_BYTES: usize = 16 * 1024 * 1024;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub config: Config,
     pub accounts: AccountManager,
     http: reqwest::Client,
+    fingerprint: MogickFingerprint,
 }
 
 impl AppState {
@@ -44,10 +46,18 @@ impl AppState {
             .read_timeout(Duration::from_secs(config.upstream.timeout_secs))
             .build()
             .context("building upstream HTTP client")?;
+        let fingerprint = MogickFingerprint::new(
+            &config.headers.app_id,
+            &config.headers.user_agent,
+            defaults::UPSTREAM_CLIENT_TYPE,
+            defaults::UPSTREAM_CLIENT_VERSION,
+        )
+        .context("building Mogick upstream fingerprint")?;
         Ok(Self {
             config,
             accounts,
             http,
+            fingerprint,
         })
     }
 }
@@ -921,6 +931,7 @@ async fn send_once(
         state.config.upstream.base_url.trim_end_matches('/'),
         path
     );
+    let stream = request_is_stream(headers, &body);
     let mut request = state
         .http
         .request(method.clone(), url)
@@ -935,10 +946,10 @@ async fn send_once(
             request = request.header(name, value);
         }
     }
-    request = request.header("X-App-Id", crate::config::defaults::UPSTREAM_X_APP_ID);
     if !headers.contains_key(header::CONTENT_TYPE) && !body.is_empty() {
         request = request.header(header::CONTENT_TYPE, "application/json");
     }
+    request = request.headers(state.fingerprint.headers(stream));
     let response = request.body(body).send().await;
     match &response {
         Ok(response) => tracing::info!(
@@ -1499,14 +1510,7 @@ fn append_query(mut path: String, query: Option<&str>) -> String {
 fn is_forwardable_request_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "accept"
-            | "accept-encoding"
-            | "accept-language"
-            | "content-type"
-            | "user-agent"
-            | "x-request-id"
-            | "x-client-type"
-            | "x-session-id"
+        "accept-language" | "content-type"
     )
 }
 
@@ -1595,10 +1599,24 @@ fn copy_anthropic_rate_headers(target: &mut HeaderMap, source: &HeaderMap) {
 }
 
 fn is_reserved_upstream_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
     matches!(
-        name.to_ascii_lowercase().as_str(),
-        "authorization" | "cookie" | "host" | "content-length" | "x-app-id"
-    )
+        lower.as_str(),
+        "authorization"
+            | "cookie"
+            | "host"
+            | "content-length"
+            | "accept"
+            | "accept-encoding"
+            | "user-agent"
+            | "traceparent"
+            | "x-app-id"
+            | "x-client-type"
+            | "x-client-version"
+            | "x-llm-store-resumable"
+            | "x-llm-store-stream-error-events"
+            | "x-session-id"
+    ) || lower.starts_with("x-mogick-")
 }
 
 pub async fn serve(state: AppState) -> Result<()> {
@@ -1654,6 +1672,7 @@ mod tests {
         authorization: String,
         x_app_id: String,
         request_id: String,
+        headers: HeaderMap,
         body: Value,
     }
 
@@ -1682,6 +1701,7 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string(),
+            headers: headers.clone(),
             body: value.clone(),
         });
         if state.rate_limit_first && authorization == "Bearer token-a" {
@@ -1925,6 +1945,11 @@ mod tests {
         );
         assert!(!is_forwardable_request_header("anthropic-version"));
         assert!(!is_forwardable_request_header("anthropic-beta"));
+        assert!(!is_forwardable_request_header("user-agent"));
+        assert!(!is_forwardable_request_header("x-request-id"));
+        assert!(!is_forwardable_request_header("x-session-id"));
+        assert!(is_reserved_upstream_header("Traceparent"));
+        assert!(is_reserved_upstream_header("X-Mogick-Run-Id"));
     }
 
     #[test]
@@ -1956,10 +1981,24 @@ mod tests {
     #[tokio::test]
     async fn openai_passthrough_preserves_query_model_and_forces_auth_headers() {
         let (app, mock, auth_path, task) = test_gateway(false, false, 1024 * 1024).await;
-        let request = gateway_request(
+        let mut request = gateway_request(
             Method::POST,
             "/v1/embeddings?dimensions=8",
             Body::from(r#"{"model":"mm-arbitrary-new","input":"hello"}"#),
+        );
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("spoof-client/1"),
+        );
+        request
+            .headers_mut()
+            .insert("x-client-type", HeaderValue::from_static("spoof"));
+        request
+            .headers_mut()
+            .insert("x-session-id", HeaderValue::from_static("spoof-session"));
+        request.headers_mut().insert(
+            "traceparent",
+            HeaderValue::from_static("00-11111111111111111111111111111111-2222222222222222-01"),
         );
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1972,7 +2011,37 @@ mod tests {
         assert_eq!(seen[0].uri, "/api/v1/embeddings?dimensions=8");
         assert_eq!(seen[0].authorization, "Bearer token-a");
         assert_eq!(seen[0].x_app_id, "mogick");
-        assert_eq!(seen[0].request_id, "req-integration");
+        assert_eq!(seen[0].request_id, "");
+        assert_eq!(seen[0].headers[header::USER_AGENT], "mogick/26");
+        assert_eq!(seen[0].headers[header::ACCEPT], "application/json");
+        assert_eq!(seen[0].headers[header::ACCEPT_ENCODING], "gzip");
+        assert_eq!(seen[0].headers["x-client-type"], "mogick");
+        assert_eq!(seen[0].headers["x-client-version"], "26.8.28.4243");
+        assert_eq!(seen[0].headers["x-llm-store-resumable"], "true");
+        assert_eq!(seen[0].headers["x-llm-store-stream-error-events"], "true");
+        let session = seen[0].headers["x-session-id"].to_str().unwrap();
+        assert!(session.starts_with("ses_"));
+        assert_eq!(session, seen[0].headers["x-mogick-session-id"]);
+        assert!(seen[0].headers["x-mogick-run-id"]
+            .to_str()
+            .unwrap()
+            .starts_with("run_"));
+        assert!(seen[0].headers["x-mogick-turn-id"]
+            .to_str()
+            .unwrap()
+            .starts_with("turn_"));
+        assert!(seen[0].headers["x-mogick-step-id"]
+            .to_str()
+            .unwrap()
+            .starts_with("step_"));
+        assert!(seen[0].headers["x-mogick-llm-call-id"]
+            .to_str()
+            .unwrap()
+            .starts_with("mc_"));
+        let traceparent = seen[0].headers["traceparent"].to_str().unwrap();
+        assert_eq!(traceparent.len(), 55);
+        assert!(traceparent.starts_with("00-"));
+        assert!(traceparent.ends_with("-01"));
         drop(seen);
         task.abort();
         std::fs::remove_file(auth_path).unwrap();
@@ -1994,6 +2063,18 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].authorization, "Bearer token-a");
         assert_eq!(seen[1].authorization, "Bearer token-b");
+        assert_eq!(
+            seen[0].headers["x-session-id"],
+            seen[1].headers["x-session-id"]
+        );
+        assert_ne!(
+            seen[0].headers["x-mogick-run-id"],
+            seen[1].headers["x-mogick-run-id"]
+        );
+        assert_ne!(
+            seen[0].headers["traceparent"],
+            seen[1].headers["traceparent"]
+        );
         drop(seen);
         task.abort();
         std::fs::remove_file(auth_path).unwrap();

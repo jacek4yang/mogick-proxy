@@ -19,7 +19,7 @@ hyper = { version = "1", features = ["full"] }
 
 # Async runtime + HTTP client
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "http2"] }
 futures-util = "0.3"
 
 # Serialization
@@ -37,6 +37,8 @@ bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
+ulid = "1"
+rand = "0.9"
 async-stream = "0.3"
 
 [profile.release]

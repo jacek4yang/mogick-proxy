@@ -2,6 +2,7 @@
 
 mod anthropic;
 mod config;
+mod fingerprint;
 mod oauth;
 mod server;
 mod token;

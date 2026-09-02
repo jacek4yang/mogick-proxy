@@ -535,7 +535,15 @@ mod tests {
         );
         let clean = fs::read_to_string(&config_path).unwrap();
         assert!(!clean.contains("secret"));
-        assert!(!clean.contains("oauth"));
+        let clean_value: serde_json::Value = serde_json::from_str(&clean).unwrap();
+        let clean_object = clean_value.as_object().unwrap();
+        assert!(!clean_object.contains_key("oauth"));
+        assert!(!clean_object.contains_key("tokens"));
+        assert!(!clean_object.contains_key("accounts"));
+        assert_eq!(
+            clean_value["headers"]["oauth_user_agent"],
+            defaults::OAUTH_USER_AGENT
+        );
         let auth = AuthStore::load(&auth_path).unwrap();
         assert_eq!(auth.accounts["default"].access_token, "access-secret");
         assert_eq!(
