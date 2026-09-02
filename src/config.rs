@@ -17,11 +17,17 @@ pub mod defaults {
     pub const UPSTREAM_BASE_URL: &str = "https://copilot.tongyuan.cc";
     pub const UPSTREAM_API_PREFIX: &str = "/api/v1";
     pub const UPSTREAM_X_APP_ID: &str = "mogick";
+    pub const UPSTREAM_USER_AGENT: &str = "mogick/26";
+    pub const OAUTH_USER_AGENT: &str = "Go-http-client/2.0";
+    pub const UPSTREAM_CLIENT_TYPE: &str = "mogick";
+    pub const UPSTREAM_CLIENT_VERSION: &str = "26.8.28.4243";
     pub const UPSTREAM_TIMEOUT_SECS: u64 = 600;
     pub const SERVER_BIND: &str = "127.0.0.1:8787";
     pub const BALANCE_POLL_SECS: u64 = 180;
     pub const REFRESH_SKEW_SECS: i64 = 60;
     pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+    pub const STREAM_PROGRESS_SECS: u64 = 30;
+    pub const MAX_PROMPT_PREVIEW_CHARS: usize = 512;
 }
 
 /// Provider-owned OAuth settings are deliberately not configurable or persisted.
@@ -31,6 +37,7 @@ pub struct OAuthConfig {
     pub device_authorization_endpoint: String,
     pub token_endpoint: String,
     pub scope: String,
+    pub user_agent: String,
 }
 
 pub fn provider_oauth() -> OAuthConfig {
@@ -39,6 +46,7 @@ pub fn provider_oauth() -> OAuthConfig {
         device_authorization_endpoint: defaults::DEVICE_AUTHORIZATION_ENDPOINT.into(),
         token_endpoint: defaults::TOKEN_ENDPOINT.into(),
         scope: defaults::OAUTH_SCOPE.into(),
+        user_agent: defaults::OAUTH_USER_AGENT.into(),
     }
 }
 
@@ -47,7 +55,40 @@ pub fn provider_oauth() -> OAuthConfig {
 pub struct Config {
     pub server: ServerConfig,
     pub upstream: UpstreamConfig,
+    pub headers: HeaderConfig,
     pub runtime: RuntimeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HeaderConfig {
+    pub app_id: String,
+    pub user_agent: String,
+    pub oauth_user_agent: String,
+}
+
+impl Default for HeaderConfig {
+    fn default() -> Self {
+        Self {
+            app_id: defaults::UPSTREAM_X_APP_ID.into(),
+            user_agent: defaults::UPSTREAM_USER_AGENT.into(),
+            oauth_user_agent: defaults::OAUTH_USER_AGENT.into(),
+        }
+    }
+}
+
+impl HeaderConfig {
+    fn apply_defaults(&mut self) {
+        if self.app_id.trim().is_empty() {
+            self.app_id = defaults::UPSTREAM_X_APP_ID.into();
+        }
+        if self.user_agent.trim().is_empty() {
+            self.user_agent = defaults::UPSTREAM_USER_AGENT.into();
+        }
+        if self.oauth_user_agent.trim().is_empty() {
+            self.oauth_user_agent = defaults::OAUTH_USER_AGENT.into();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +167,10 @@ pub struct RuntimeConfig {
     pub refresh_skew_secs: i64,
     pub balance_poll_secs: u64,
     pub max_request_bytes: usize,
+    /// Emit an active-stream progress record at this cadence. Zero disables it.
+    pub stream_progress_secs: u64,
+    /// Opt-in preview length for the last user text. Zero keeps prompt text private.
+    pub log_prompt_preview_chars: usize,
     pub log_level: String,
     pub log_format: LogFormat,
 }
@@ -136,6 +181,8 @@ impl Default for RuntimeConfig {
             refresh_skew_secs: defaults::REFRESH_SKEW_SECS,
             balance_poll_secs: defaults::BALANCE_POLL_SECS,
             max_request_bytes: defaults::MAX_REQUEST_BYTES,
+            stream_progress_secs: defaults::STREAM_PROGRESS_SECS,
+            log_prompt_preview_chars: 0,
             log_level: "info".into(),
             log_format: LogFormat::Pretty,
         }
@@ -153,6 +200,12 @@ impl RuntimeConfig {
         if self.max_request_bytes == 0 {
             self.max_request_bytes = defaults::MAX_REQUEST_BYTES;
         }
+        if self.stream_progress_secs > 0 {
+            self.stream_progress_secs = self.stream_progress_secs.clamp(10, 3_600);
+        }
+        self.log_prompt_preview_chars = self
+            .log_prompt_preview_chars
+            .min(defaults::MAX_PROMPT_PREVIEW_CHARS);
         if self.log_level.trim().is_empty() {
             self.log_level = "info".into();
         }
@@ -182,6 +235,7 @@ impl Config {
             self.server.bind = defaults::SERVER_BIND.into();
         }
         self.upstream.apply_defaults();
+        self.headers.apply_defaults();
         self.runtime.apply_defaults();
     }
 
@@ -359,6 +413,9 @@ fn same_credentials(left: &AccountAuth, right: &AccountAuth) -> bool {
 }
 
 fn atomic_write(path: &Path, body: &[u8], secret: bool) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = secret;
+
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating directory {}", parent.display()))?;

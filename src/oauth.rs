@@ -86,6 +86,7 @@ pub async fn request_device_code(
 ) -> Result<DeviceCodeResponse> {
     let response = http
         .post(&config.device_authorization_endpoint)
+        .header(reqwest::header::USER_AGENT, &config.user_agent)
         .form(&[
             ("client_id", config.client_id.as_str()),
             ("scope", config.scope.as_str()),
@@ -124,6 +125,7 @@ pub async fn poll_for_token(
         poll_sleep(interval).await;
         let response = http
             .post(&config.token_endpoint)
+            .header(reqwest::header::USER_AGENT, &config.user_agent)
             .header(reqwest::header::ACCEPT, "application/json")
             .header("X-App-Id", crate::config::defaults::UPSTREAM_X_APP_ID)
             .form(&[
@@ -186,6 +188,7 @@ pub async fn refresh_access_token(
     let started = std::time::Instant::now();
     let response = http
         .post(&config.token_endpoint)
+        .header(reqwest::header::USER_AGENT, &config.user_agent)
         .header(reqwest::header::ACCEPT, "application/json")
         .header("X-App-Id", crate::config::defaults::UPSTREAM_X_APP_ID)
         .form(&[
@@ -454,6 +457,7 @@ mod tests {
                 device_authorization_endpoint: format!("http://{address}/device"),
                 token_endpoint: format!("http://{address}/token"),
                 scope: "openid profile email".into(),
+                user_agent: "Go-http-client/2.0".into(),
             },
             calls,
             task,

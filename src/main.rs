@@ -151,6 +151,7 @@ async fn cmd_login(
 ) -> Result<()> {
     let account = resolve_account(account)?;
     let config = load_corrected_config(config_path)?;
+    let oauth_user_agent = config.headers.oauth_user_agent.clone();
     let manager = AccountManager::new(config, auth_path.to_path_buf())?;
     if let Some(existing) = manager.snapshots().await?.accounts.get(&account) {
         if existing.has_credentials() && !force {
@@ -159,7 +160,8 @@ async fn cmd_login(
         }
     }
 
-    let oauth = provider_oauth();
+    let mut oauth = provider_oauth();
+    oauth.user_agent = oauth_user_agent;
     let http = reqwest::Client::builder()
         // Provider endpoints are directly reachable; a broken system SOCKS
         // proxy must not prevent device login or token rotation.
@@ -267,6 +269,22 @@ async fn cmd_serve(config_path: &Path, auth_path: &Path) -> Result<()> {
         config.runtime.refresh_skew_secs,
         ((config.runtime.refresh_skew_secs.max(1) as u64) / 2).clamp(5, 60)
     );
+    if config.runtime.stream_progress_secs == 0 {
+        println!("stream progress logs: disabled");
+    } else {
+        println!(
+            "stream progress logs: every {}s while active",
+            config.runtime.stream_progress_secs
+        );
+    }
+    if config.runtime.log_prompt_preview_chars == 0 {
+        println!("prompt preview: disabled (request structure and text length are still logged)");
+    } else {
+        println!(
+            "prompt preview: last user text, up to {} chars (sensitive patterns redacted)",
+            config.runtime.log_prompt_preview_chars
+        );
+    }
     let background = manager.clone();
     tokio::spawn(async move { background.background_loop().await });
     server::serve(AppState::new(config, manager)?).await

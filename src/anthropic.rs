@@ -1,7 +1,7 @@
 //! Anthropic Messages v1 to OpenAI Chat Completions protocol conversion.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use bytes::Bytes;
@@ -36,6 +36,8 @@ pub struct ConvertedRequest {
     pub body: Value,
     pub model: String,
     pub stream: bool,
+    /// Byte-based estimate of the effective prompt that will reach upstream.
+    pub estimated_input_tokens: usize,
     pub compaction: Option<CompactionConfig>,
     pub structured_output: Option<StructuredOutputConfig>,
     pub thinking_display: ThinkingDisplay,
@@ -112,6 +114,118 @@ const STREAM_PING_INTERVAL: Duration = Duration::from_secs(10);
 const STREAM_PING_INTERVAL: Duration = Duration::from_millis(25);
 const STRUCTURED_OUTPUT_INSTRUCTION_PREFIX: &str =
     "Return exactly one JSON object for output format ";
+
+struct StreamTelemetry {
+    request_id: String,
+    model: String,
+    account: String,
+    started: Instant,
+    upstream_chunks: u64,
+    upstream_bytes: u64,
+    upstream_events: u64,
+    downstream_frames: u64,
+    downstream_bytes: u64,
+    pings: u64,
+    saw_first_event: bool,
+    finished: bool,
+}
+
+impl StreamTelemetry {
+    fn new(request_id: &str, model: &str, account: String, started: Instant) -> Self {
+        Self {
+            request_id: request_id.to_owned(),
+            model: model.to_owned(),
+            account,
+            started,
+            upstream_chunks: 0,
+            upstream_bytes: 0,
+            upstream_events: 0,
+            downstream_frames: 0,
+            downstream_bytes: 0,
+            pings: 0,
+            saw_first_event: false,
+            finished: false,
+        }
+    }
+
+    fn record_upstream_chunk(&mut self, bytes: usize) {
+        self.upstream_chunks = self.upstream_chunks.saturating_add(1);
+        self.upstream_bytes = self.upstream_bytes.saturating_add(bytes as u64);
+    }
+
+    fn record_upstream_event(&mut self) {
+        self.upstream_events = self.upstream_events.saturating_add(1);
+        if self.saw_first_event {
+            return;
+        }
+        self.saw_first_event = true;
+        tracing::info!(
+            request_id = %self.request_id,
+            model = %self.model,
+            account = %self.account,
+            time_to_first_event_ms = self.started.elapsed().as_millis(),
+            "Anthropic stream received first event"
+        );
+    }
+
+    fn record_frame(&mut self, bytes: usize) {
+        self.downstream_frames = self.downstream_frames.saturating_add(1);
+        self.downstream_bytes = self.downstream_bytes.saturating_add(bytes as u64);
+    }
+
+    fn record_ping(&mut self, bytes: usize) {
+        self.pings = self.pings.saturating_add(1);
+        self.record_frame(bytes);
+    }
+
+    fn log_progress(&self) {
+        tracing::info!(
+            request_id = %self.request_id,
+            model = %self.model,
+            account = %self.account,
+            phase = if self.saw_first_event { "streaming" } else { "waiting_first_event" },
+            elapsed_ms = self.started.elapsed().as_millis(),
+            upstream_chunks = self.upstream_chunks,
+            upstream_bytes = self.upstream_bytes,
+            upstream_events = self.upstream_events,
+            downstream_frames = self.downstream_frames,
+            downstream_bytes = self.downstream_bytes,
+            pings = self.pings,
+            "Anthropic stream still active"
+        );
+    }
+
+    fn finish(&mut self, outcome: &'static str, finish_reason: Option<&str>, output_tokens: u64) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        tracing::info!(
+            request_id = %self.request_id,
+            model = %self.model,
+            account = %self.account,
+            outcome,
+            finish_reason = finish_reason.unwrap_or(""),
+            duration_ms = self.started.elapsed().as_millis(),
+            upstream_chunks = self.upstream_chunks,
+            upstream_bytes = self.upstream_bytes,
+            upstream_events = self.upstream_events,
+            downstream_frames = self.downstream_frames,
+            downstream_bytes = self.downstream_bytes,
+            pings = self.pings,
+            output_tokens,
+            "Anthropic stream closed"
+        );
+    }
+}
+
+impl Drop for StreamTelemetry {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish("client_disconnected", None, 0);
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct ContextEdits {
@@ -361,6 +475,7 @@ fn convert_request_inner(
         body: Value::Object(output),
         model,
         stream,
+        estimated_input_tokens: effective_input_bytes.div_ceil(4),
         compaction: context_edits.compaction,
         structured_output,
         thinking_display,
@@ -2389,6 +2504,9 @@ pub fn stream_body_with_context(
     response: reqwest::Response,
     request_id: String,
     fallback_model: String,
+    account: String,
+    request_started: Instant,
+    stream_progress_secs: u64,
     thinking_display: ThinkingDisplay,
     compaction: Option<CompactionPrelude>,
     context_management: Option<ContextManagementResult>,
@@ -2397,6 +2515,16 @@ pub fn stream_body_with_context(
         let mut upstream = response.bytes_stream();
         let idle = tokio::time::sleep(STREAM_PING_INTERVAL);
         tokio::pin!(idle);
+        let progress_interval = Duration::from_secs(stream_progress_secs.max(1));
+        let progress = tokio::time::sleep(progress_interval);
+        tokio::pin!(progress);
+        let progress_enabled = stream_progress_secs > 0;
+        let mut telemetry = StreamTelemetry::new(
+            &request_id,
+            &fallback_model,
+            account,
+            request_started,
+        );
         let mut decoder = SseDecoder::default();
         let mut state = StreamState::new(
             request_id,
@@ -2410,25 +2538,41 @@ pub fn stream_body_with_context(
                 biased;
                 chunk = upstream.next() => match chunk {
                     Some(Ok(chunk)) => {
+                        telemetry.record_upstream_chunk(chunk.len());
                         let events = match decoder.push(&chunk) {
                             Ok(events) => events,
                             Err(()) => {
-                                yield Ok(sse_frame("error", error_envelope(
+                                let frame = sse_frame("error", error_envelope(
                                     "api_error",
                                     "upstream SSE event exceeded the gateway limit",
                                     &state.request_id,
-                                )));
+                                ));
+                                telemetry.record_frame(frame.len());
+                                telemetry.finish("decode_error", None, state.output_tokens());
+                                yield Ok(frame);
                                 return;
                             }
                         };
                         for event in events {
+                            telemetry.record_upstream_event();
                             for frame in state.handle(&event.data) {
                                 idle.as_mut().reset(
                                     tokio::time::Instant::now() + STREAM_PING_INTERVAL,
                                 );
+                                telemetry.record_frame(frame.len());
                                 yield Ok::<Bytes, std::io::Error>(frame);
                             }
                             if state.terminal {
+                                let outcome = if state.finish_reason.is_some() {
+                                    "complete"
+                                } else {
+                                    "protocol_error"
+                                };
+                                telemetry.finish(
+                                    outcome,
+                                    state.finish_reason.as_deref(),
+                                    state.output_tokens(),
+                                );
                                 return;
                             }
                         }
@@ -2439,11 +2583,14 @@ pub fn stream_body_with_context(
                             timeout = error.is_timeout(),
                             "upstream Anthropic stream interrupted"
                         );
-                        yield Ok(sse_frame("error", error_envelope(
+                        let frame = sse_frame("error", error_envelope(
                             "api_error",
                             "upstream stream was interrupted",
                             &state.request_id,
-                        )));
+                        ));
+                        telemetry.record_frame(frame.len());
+                        telemetry.finish("upstream_error", None, state.output_tokens());
+                        yield Ok(frame);
                         return;
                     }
                     None => break,
@@ -2453,39 +2600,70 @@ pub fn stream_body_with_context(
                     // response. Emit one only when no client-visible frame
                     // has been produced recently, so Claude Code does not
                     // mistake a slow reasoning interval for a dead stream.
-                    yield Ok(sse_frame("ping", json!({"type":"ping"})));
+                    let frame = sse_frame("ping", json!({"type":"ping"}));
+                    telemetry.record_ping(frame.len());
+                    yield Ok(frame);
                     idle.as_mut().reset(tokio::time::Instant::now() + STREAM_PING_INTERVAL);
+                }
+                _ = &mut progress, if progress_enabled => {
+                    telemetry.log_progress();
+                    progress.as_mut().reset(tokio::time::Instant::now() + progress_interval);
                 }
             }
         }
         let trailing_events = match decoder.finish() {
             Ok(events) => events,
             Err(()) => {
-                yield Ok(sse_frame("error", error_envelope(
+                let frame = sse_frame("error", error_envelope(
                     "api_error",
                     "upstream SSE event exceeded the gateway limit",
                     &state.request_id,
-                )));
+                ));
+                telemetry.record_frame(frame.len());
+                telemetry.finish("decode_error", None, state.output_tokens());
+                yield Ok(frame);
                 return;
             }
         };
         for event in trailing_events {
+            telemetry.record_upstream_event();
             for frame in state.handle(&event.data) {
+                telemetry.record_frame(frame.len());
                 yield Ok(frame);
             }
         }
         if !state.terminal {
             if state.finish_reason.is_some() {
                 for frame in state.finalize() {
+                    telemetry.record_frame(frame.len());
                     yield Ok(frame);
                 }
+                telemetry.finish(
+                    "complete",
+                    state.finish_reason.as_deref(),
+                    state.output_tokens(),
+                );
             } else {
-                yield Ok(sse_frame("error", error_envelope(
+                let frame = sse_frame("error", error_envelope(
                     "api_error",
                     "upstream stream ended unexpectedly",
                     &state.request_id,
-                )));
+                ));
+                telemetry.record_frame(frame.len());
+                telemetry.finish("unexpected_eof", None, state.output_tokens());
+                yield Ok(frame);
             }
+        } else {
+            let outcome = if state.finish_reason.is_some() {
+                "complete"
+            } else {
+                "protocol_error"
+            };
+            telemetry.finish(
+                outcome,
+                state.finish_reason.as_deref(),
+                state.output_tokens(),
+            );
         }
     };
     Body::from_stream(output)
@@ -2789,6 +2967,13 @@ impl StreamState {
             }
         }
         frames
+    }
+
+    fn output_tokens(&self) -> u64 {
+        self.usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
     }
 
     fn ensure_text(&mut self, frames: &mut Vec<Bytes>) -> usize {

@@ -96,7 +96,9 @@ struct BalanceEnvelope {
 
 impl AccountManager {
     pub fn new(config: Config, auth_path: PathBuf) -> Result<Self> {
-        Self::new_with_oauth(config, auth_path, provider_oauth())
+        let mut oauth = provider_oauth();
+        oauth.user_agent = config.headers.oauth_user_agent.clone();
+        Self::new_with_oauth(config, auth_path, oauth)
     }
 
     pub(crate) fn new_with_oauth(
@@ -465,7 +467,12 @@ impl AccountManager {
                 request = request.header(key, value);
             }
         }
-        request = request.header("X-App-Id", crate::config::defaults::UPSTREAM_X_APP_ID);
+        request = request
+            .header("X-App-Id", &self.inner.config.headers.app_id)
+            .header(
+                reqwest::header::USER_AGENT,
+                &self.inner.config.headers.oauth_user_agent,
+            );
         let response = request.send().await.context("requesting user balance")?;
         let status = response.status();
         tracing::info!(
@@ -808,6 +815,7 @@ mod tests {
             device_authorization_endpoint: format!("http://{address}/device"),
             token_endpoint: format!("http://{address}/token"),
             scope: "openid profile email".into(),
+            user_agent: "Go-http-client/2.0".into(),
         };
         let manager =
             AccountManager::new_with_oauth(Config::default(), path.clone(), oauth).unwrap();
@@ -874,6 +882,7 @@ mod tests {
             device_authorization_endpoint: format!("http://{address}/device"),
             token_endpoint: format!("http://{address}/token"),
             scope: "openid profile email".into(),
+            user_agent: "Go-http-client/2.0".into(),
         };
         let manager =
             AccountManager::new_with_oauth(Config::default(), path.clone(), oauth).unwrap();

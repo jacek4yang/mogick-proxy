@@ -40,6 +40,8 @@ cargo build --release
     "refresh_skew_secs": 60,
     "balance_poll_secs": 180,
     "max_request_bytes": 33554432,
+    "stream_progress_secs": 30,
+    "log_prompt_preview_chars": 0,
     "log_level": "info",
     "log_format": "pretty"
   }
@@ -164,7 +166,11 @@ fast mode、diagnostics、task budget、fallback 和顶层缓存提示会被校�
 
 ## 日志与错误
 
-所有入站响应和每次上游尝试都会生成单行日志，包括鉴权失败、请求大小错误、健康检查、401 重试、429 切换、OAuth 和余额响应。请求日志包含 request ID、协议、模型、账户、路径、stream、状态、耗时、请求/响应字节、refresh 和 failover。不会记录请求正文。错误正文会截断，并递归清除 Authorization、cookie、API key、access/refresh token、Bearer 和 JWT。
+所有入站响应和每次上游尝试都会生成单行日志，包括鉴权失败、请求大小错误、健康检查、401 重试、429 切换、OAuth 和余额响应。Anthropic 请求摘要额外包含消息/系统/tool-result/tool 数量、有效 input token 估算、约束输出/context edit/compaction 状态，以及最后一条用户文本的字符数；不会记录图像、工具结果或完整请求正文。
+
+流式请求会分别记录首个上游事件和最终关闭状态；超过 `runtime.stream_progress_secs`（默认 30 秒）时，以该低频间隔记录累计上游 chunk/event/byte、下游 frame/byte、心跳及耗时，让长时间推理与真正停滞可以区分。设为 `0` 可关闭周期进度日志。
+
+提示词文本预览默认关闭。确有本地调试需要时，可将 `runtime.log_prompt_preview_chars` 设置为 `1..512`，日志只显示最后一条用户文本的截断预览，并对 Bearer/JWT 等已知敏感模式脱敏。预览仍可能包含用户主动写入的其他私密内容，因此不要在共享或集中式日志环境开启。错误正文会截断，并递归清除 Authorization、cookie、API key、access/refresh token、Bearer 和 JWT。
 
 Anthropic 错误使用：
 

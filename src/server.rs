@@ -348,6 +348,12 @@ async fn anthropic_messages(
         Ok(converted) => converted,
         Err(error) => return protocol_error(error, &request_id),
     };
+    log_anthropic_request(
+        &converted,
+        &request_id,
+        request_bytes,
+        state.config.runtime.log_prompt_preview_chars,
+    );
     let path = format!("{}/chat/completions", state.config.upstream.api_prefix);
     let mut compaction_prelude = None;
 
@@ -595,7 +601,8 @@ async fn anthropic_messages(
         response_bytes,
         refresh = result.refreshed,
         failover = result.failover_count,
-        "request complete"
+        phase = if converted.stream { "stream_connected" } else { "complete" },
+        "Anthropic response ready"
     );
     if !status.is_success() {
         return anthropic_upstream_error(result.response, &request_id).await;
@@ -612,6 +619,9 @@ async fn anthropic_messages(
                 result.response,
                 request_id.clone(),
                 converted.model,
+                result.account,
+                started,
+                state.config.runtime.stream_progress_secs,
                 converted.thinking_display,
                 compaction_prelude,
                 converted.context_management,
@@ -1106,6 +1116,114 @@ fn sanitize_text(input: &str) -> String {
     output.join(" ").chars().take(1024).collect()
 }
 
+fn log_anthropic_request(
+    request: &anthropic::ConvertedRequest,
+    request_id: &str,
+    request_bytes: usize,
+    prompt_preview_chars: usize,
+) {
+    let messages = request
+        .body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let message_count = messages.len();
+    let system_messages = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .count();
+    let tool_result_messages = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .count();
+    let tool_count = request
+        .body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let (last_user_chars, prompt_preview) = last_user_text_summary(
+        messages,
+        prompt_preview_chars.min(crate::config::defaults::MAX_PROMPT_PREVIEW_CHARS),
+    );
+    let prompt_preview = if prompt_preview_chars == 0 {
+        "[disabled]".to_owned()
+    } else {
+        prompt_preview.unwrap_or_else(|| "[no user text]".into())
+    };
+    tracing::info!(
+        direction = "client",
+        request_id,
+        protocol = "anthropic",
+        model = %request.model,
+        stream = request.stream,
+        request_bytes,
+        estimated_input_tokens = request.estimated_input_tokens,
+        message_count,
+        system_messages,
+        tool_result_messages,
+        tool_count,
+        strict_tools = request.strict_tools.len(),
+        structured_output = request.structured_output.is_some(),
+        context_edits = request
+            .context_management
+            .as_ref()
+            .map_or(0, |context| context.applied_edits.len()),
+        compaction_requested = request.compaction.is_some(),
+        compaction_triggered = request
+            .compaction
+            .as_ref()
+            .is_some_and(anthropic::CompactionConfig::should_compact),
+        last_user_chars,
+        prompt_preview = %prompt_preview,
+        "Anthropic request parsed"
+    );
+}
+
+fn last_user_text_summary(messages: &[Value], preview_chars: usize) -> (usize, Option<String>) {
+    let Some(content) = messages.iter().rev().find_map(|message| {
+        (message.get("role").and_then(Value::as_str) == Some("user"))
+            .then(|| message.get("content"))
+            .flatten()
+    }) else {
+        return (0, None);
+    };
+    let mut text_chars = 0usize;
+    let mut preview = String::new();
+    let scan_limit = preview_chars.saturating_add(256);
+    let mut append = |text: &str| {
+        text_chars = text_chars.saturating_add(text.chars().count());
+        if preview_chars == 0 || preview.chars().count() >= scan_limit {
+            return;
+        }
+        if !preview.is_empty() {
+            preview.push(' ');
+        }
+        let remaining = scan_limit.saturating_sub(preview.chars().count());
+        preview.extend(text.chars().take(remaining));
+    };
+    match content {
+        Value::String(text) => append(text),
+        Value::Array(blocks) => {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        append(text);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let preview = (preview_chars > 0 && !preview.is_empty()).then(|| {
+        sanitize_text(&preview)
+            .chars()
+            .take(preview_chars)
+            .collect()
+    });
+    (text_chars, preview)
+}
+
 fn looks_like_jwt(value: &str) -> bool {
     value.len() > 30
         && value.matches('.').count() == 2
@@ -1158,6 +1276,12 @@ async fn response_log_middleware(request: Request<Body>, next: Next) -> Response
         "openai"
     };
     let response = next.run(request).await;
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let streaming = content_type.contains("text/event-stream");
     tracing::info!(
         direction = "client",
         request_id,
@@ -1172,12 +1296,9 @@ async fn response_log_middleware(request: Request<Body>, next: Next) -> Response
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0),
-        content_type = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(""),
-        "client response"
+        content_type,
+        phase = if streaming { "stream_open" } else { "complete" },
+        "client response ready"
     );
     response
 }
@@ -1934,6 +2055,7 @@ mod tests {
             device_authorization_endpoint: format!("http://{address}/device"),
             token_endpoint: format!("http://{address}/oauth/token"),
             scope: "openid profile email".into(),
+            user_agent: "Go-http-client/2.0".into(),
         };
         let manager =
             AccountManager::new_with_oauth(config.clone(), auth_path.clone(), oauth).unwrap();
@@ -1994,6 +2116,7 @@ mod tests {
             device_authorization_endpoint: format!("http://{address}/device"),
             token_endpoint: format!("http://{address}/oauth/token"),
             scope: "openid profile email".into(),
+            user_agent: "Go-http-client/2.0".into(),
         };
         let manager =
             AccountManager::new_with_oauth(config.clone(), auth_path.clone(), oauth).unwrap();

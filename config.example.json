@@ -11,10 +11,17 @@
       "X-App-Id": "mogick"
     }
   },
+  "headers": {
+    "app_id": "mogick",
+    "user_agent": "mogick/26",
+    "oauth_user_agent": "Go-http-client/2.0"
+  },
   "runtime": {
     "refresh_skew_secs": 60,
     "balance_poll_secs": 180,
     "max_request_bytes": 33554432,
+    "stream_progress_secs": 30,
+    "log_prompt_preview_chars": 0,
     "log_level": "info",
     "log_format": "pretty"
   }
